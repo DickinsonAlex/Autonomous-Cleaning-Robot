@@ -14,7 +14,7 @@ class TidyBotController(Node):
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
         
         # Subscribers for camera and LiDAR data
-        self.create_subscription(Image, 'camera/rgb/image_raw', self.image_callback, 10)
+        self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
         self.create_subscription(LaserScan, 'scan', self.scan_callback, 10)
         
         # Timer to run the control loop
@@ -36,6 +36,10 @@ class TidyBotController(Node):
         
         # Process image to detect objects
         self.detect_objects(cv_image)
+
+        # Display image with detected objects
+        cv2.imshow('Image window', cv_image)
+        cv2.waitKey(1)
 
     def scan_callback(self, msg):
         # Store LiDAR data
@@ -79,7 +83,7 @@ class TidyBotController(Node):
         else:
             # Stop the robot if no objects are detected
             self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.0
+            self.twist.angular.z = 1.0
             self.velocity_publisher.publish(self.twist)
 
     def push_object(self, x, y, direction):

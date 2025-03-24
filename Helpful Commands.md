@@ -15,6 +15,5 @@
 `ros2 pkg create --build-type ament_python PACKAGENAME`
 2. Drag folder under relevant workshop folder
 3. Drag python scripts under **PACKAGENAME** folder
-4. To run, use `ros2 run PACKAGENAME tidybot.launch.py`
 
 HELP: https://docs.ros.org/en/humble/Tutorials/Beginner-Client-Libraries/Creating-Your-First-ROS2-Package.html
