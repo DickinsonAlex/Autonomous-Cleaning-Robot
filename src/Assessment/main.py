@@ -19,7 +19,7 @@ class TidyBotController(Node):
         self.create_subscription(LaserScan, 'scan', self.scan_callback, 10)
         
         # Timer to run the control loop
-        self.loopspeed = 0.1 # Control loop speed in seconds
+        self.loopspeed = 0.5 # Control loop speed in seconds
         self.timer = self.create_timer(self.loopspeed, self.control_loop)
         
         # Initialize Twist message for robot velocity
@@ -31,6 +31,7 @@ class TidyBotController(Node):
         # Variables to store processed data
         self.detected_blocks = []  # List of detected blocks (color, x, y, z)
         self.detected_signs = []   # List of detected signs (color, x, y, z)
+        self.moved_blocks = []     # List of blocks that have been moved to signs
         self.lidar_data = None     # LiDAR data
         
         # State machine variables
@@ -39,6 +40,7 @@ class TidyBotController(Node):
         # Location Variables
         self.current_angle = 0.0  # Initialize current angle
         self.current_position = (0.0, 0.0)  # Initialize current position
+        self.last_object_detected_time = None  # Time when an object was last detected
 
     def image_callback(self, msg):
         # Convert ROS Image message to OpenCV image
@@ -75,58 +77,50 @@ class TidyBotController(Node):
                 
         # Check if LiDAR data is available
         if self.lidar_data is None:
-            self.get_logger().warn("LiDAR data is not available yet.")
+                self.get_logger().warn("LiDAR data is not available. Skipping object detection for now.")
+                return
+    
+        # Ensure LiDAR data is valid before proceeding
+        if all(np.isinf(range_val) or range_val == 0 for range_val in self.lidar_data):
+            self.get_logger().warn("LiDAR data is invalid. Retrying object detection later.")
             return
         
         # Classify objects based on color, size, and distance
         for color, contours in [('red', red_contours), ('green', green_contours)]:
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
-                area = w * h
-                center_x, center_y = x + w // 2, y + h // 2
-                
-                # Approximate the angle of the object in the LiDAR scan
-                angle = (center_x / image.shape[1]) * 360  # Map x-coordinate to 360 degrees
-            
-                # Get the distance (z) from the LiDAR data
-                z = self.lidar_data[int(angle) % len(self.lidar_data)]
+                center_x = x + w // 2
+                center_y = y + h // 2
 
-                # Initial classification by height
-                if h > 50:
-                    # Height suggests it's likely a sign
-                    self.detected_signs.append((color, center_x, center_y, z))
-                elif h < 20:
-                    # Height suggests it's likely a close up block
-                    self.detected_blocks.append((color, center_x, center_y, z))
+                camera_hfov = 90  # Adjust based on camera's specs
+                angle = ((center_x / image.shape[1]) - 0.5) * camera_hfov # Approximate the angle of the object
+                distance = min(self.lidar_data[int(angle)], 10.0)  # Limit the distance to 10 meters
+
+                # Calculate the estimated position of the object, using self.current_angle and self.current_position
+                world_x = self.current_position[0] + distance * np.cos(np.radians(self.current_angle + angle))
+                world_y = self.current_position[1] + distance * np.sin(np.radians(self.current_angle + angle))
+
+                # Using the y position guess if the object is a block or a sign
+                if center_y > image.shape[0] // 2:
+                    self.detected_blocks.append((color, world_x, world_y))
                 else:
-                    # Height suggests it could be a block or a distant sign
-                    if area > 2500:
-                        # Small height but large area; likely a distant sign
-                        self.detected_signs.append((color, center_x, center_y, z))
-                    else:
-                        # Medium height and area; likely a block
-                        self.detected_blocks.append((color, center_x, center_y, z))
+                    self.detected_signs.append((color, world_x, world_y))
         
-        
-        # If the blocks are the same color, and close together, consider them as one block, average the position and remove the duplicates
-        for i in range(len(self.detected_blocks)):
-            for j in range(i+1, len(self.detected_blocks)):
-                if self.detected_blocks[i][0] == self.detected_blocks[j][0]:
-                    distance = np.sqrt((self.detected_blocks[i][1] - self.detected_blocks[j][1])**2 + (self.detected_blocks[i][2] - self.detected_blocks[j][2])**2)
-                    if distance < 50:
-                        self.detected_blocks[i] = (self.detected_blocks[i][0], (self.detected_blocks[i][1] + self.detected_blocks[j][1])//2, (self.detected_blocks[i][2] + self.detected_blocks[j][2])//2)
-                        self.detected_blocks.pop(j)
-                        break
+            # Remove duplicate blocks
+            unique_blocks = []
+            for block in self.detected_blocks:
+                if not any(np.hypot(block[1]-b[1], block[2]-b[2]) < 0.5 and block[0]==b[0] for b in unique_blocks):
+                    unique_blocks.append(block)
+            self.detected_blocks = unique_blocks
 
-        # If the signs are the same color, and close together, consider them as one sign, average the position and remove the duplicates
-        for i in range(len(self.detected_signs)):
-            for j in range(i+1, len(self.detected_signs)):
-                if self.detected_signs[i][0] == self.detected_signs[j][0]:
-                    distance = np.sqrt((self.detected_signs[i][1] - self.detected_signs[j][1])**2 + (self.detected_signs[i][2] - self.detected_signs[j][2])**2)
-                    if distance < 50:
-                        self.detected_signs[i] = (self.detected_signs[i][0], (self.detected_signs[i][1] + self.detected_signs[j][1])//2, (self.detected_signs[i][2] + self.detected_signs[j][2])//2)
-                        self.detected_signs.pop(j)
-                        break
+            # Average the sign positions for each color
+            sign_positions = {}
+            for sign in self.detected_signs:
+                if sign[0] not in sign_positions:
+                    sign_positions[sign[0]] = []
+                sign_positions[sign[0]].append(sign[1:])
+            self.detected_signs = [(color, np.mean([pos[0] for pos in sign_positions[color]]), np.mean([pos[1] for pos in sign_positions[color]]) ) for color in sign_positions]
+
     
         # Update the last object detection time
         if self.detected_blocks or self.detected_signs:
@@ -174,61 +168,39 @@ class TidyBotController(Node):
             print("No matching block-sign pair found.")
             return
 
-        print(f"Pushing block '{block[0]}' towards sign '{sign[0]}'")
+        print(f"Pushing block '{block} towards sign '{sign} from position {self.current_position}")
 
         # Calculate vector from sign to block
-        push_direction = np.array([sign[1] - block[1], sign[2] - block[2]], dtype=float)
-        push_direction /= np.linalg.norm(push_direction)
+        target_position = np.array(sign[1:])
+        block_position = np.array(block[1:])
+        direction = target_position - block_position
+        direction /= np.linalg.norm(direction)
+        target_position = block_position - direction * 0.5
+
+        print(f"Moving to position {target_position} from position {self.current_position}")
 
         # Position the robot slightly behind the block
-        approach_distance = 0.2  # Adjust as necessary
-        target_position = np.array([block[1], block[2]]) - push_direction * approach_distance
+        self.rotate_to_angle(np.degrees(np.arctan2(target_position[1] - self.current_position[1], target_position[0] - self.current_position[0])))
+        self.move_forward(np.hypot(target_position[0] - self.current_position[0], target_position[1] - self.current_position[1]))
+        
+        # Rotate robot to face the sign
+        angle_to_sign = np.degrees(np.arctan2(sign[2] - self.current_position[1], sign[1] - self.current_position[0]))
+        self.rotate_to_angle(angle_to_sign)
 
-        # Step 1: Move robot to target_position behind block
-        self.move_to_position(target_position)
+        # Push the block towards the sign
+        distance_to_sign = np.hypot(sign[1] - block[1], sign[2] - block[2])
+        self.move_forward(distance_to_sign)
 
-        # Step 2: Rotate robot to face the sign
-        target_angle = np.degrees(np.arctan2(push_direction[1], push_direction[0]))
-        self.rotate_to_angle(target_angle)
+        # Remove the block from the list of detected blocks, add it to the list of pushed blocks
+        self.detected_blocks.remove(block)
+        self.moved_blocks.append(block)
 
-        # Step 3: Push the block towards the sign
-        block_to_sign_distance = np.linalg.norm([sign[1] - block[1], sign[2] - block[2]])
-        self.move_forward(block_to_sign_distance + approach_distance)
-
-    def move_to_position(self, target_position):
-        while True:
-            current_pos = np.array(self.current_position)
-            distance = np.linalg.norm(target_position - current_pos)
-            if distance <= 0.05:
-                break
-
-            angle_to_target = np.degrees(np.arctan2(target_position[1] - current_pos[1], target_position[0] - current_pos[0]))
-            self.rotate_to_angle(angle_to_target, tolerance=5)
-
-            self.twist.linear.x = 0.3
-            self.twist.angular.z = 0.0
-            self.velocity_publisher.publish(self.twist)
-
-            # Update position estimate
-            self.current_position = (
-                self.current_position[0] + self.twist.linear.x * self.loopspeed * np.cos(np.radians(angle_to_target)),
-                self.current_position[1] + self.twist.linear.x * self.loopspeed * np.sin(np.radians(angle_to_target))
-            )
-
-        self.stop_movement()
-
-    def rotate_to_angle(self, target_angle, tolerance=3):
-        target_angle %= 360
-        while abs(self.current_angle - target_angle) > tolerance:
-            angle_diff = (target_angle - self.current_angle + 540) % 360 - 180
-            rotation_speed = 0.3 if angle_diff > 0 else -0.3
-
+    def rotate_to_angle(self, target_angle):
+        while abs((self.current_angle - target_angle + 180) % 360 - 180) > 2:
             self.twist.linear.x = 0.0
-            self.twist.angular.z = rotation_speed
+            self.twist.angular.z = 0.5 if ((target_angle - self.current_angle + 360) % 360) < 180 else -0.5
             self.velocity_publisher.publish(self.twist)
-
-            self.current_angle += rotation_speed * self.loopspeed
-            self.current_angle %= 360
+            rclpy.spin_once(self, timeout_sec=self.loopspeed)  # Allow ROS to process odometry updates
 
         self.stop_movement()
 
@@ -239,6 +211,7 @@ class TidyBotController(Node):
             self.twist.angular.z = 0.0
             self.velocity_publisher.publish(self.twist)
 
+            # Update position estimate
             moved_distance += self.twist.linear.x * self.loopspeed
             self.current_position = (
                 self.current_position[0] + self.twist.linear.x * self.loopspeed * np.cos(np.radians(self.current_angle)),
