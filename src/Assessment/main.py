@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 import cv2
 from cv_bridge import CvBridge
@@ -17,9 +18,12 @@ class TidyBotController(Node):
         # Subscribers for camera and LiDAR data
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
         self.create_subscription(LaserScan, 'scan', self.scan_callback, 10)
+
+        # Subscriber for odometry data
+        self.create_subscription(Odometry, 'odom', self.odometry_callback, 10)
         
         # Timer to run the control loop
-        self.loopspeed = 0.5 # Control loop speed in seconds
+        self.loopspeed = 1 # Control loop speed in seconds
         self.timer = self.create_timer(self.loopspeed, self.control_loop)
         
         # Initialize Twist message for robot velocity
@@ -41,6 +45,12 @@ class TidyBotController(Node):
         self.current_angle = 0.0  # Initialize current angle
         self.current_position = (0.0, 0.0)  # Initialize current position
         self.last_object_detected_time = None  # Time when an object was last detected
+
+    def odometry_callback(self, msg):
+        # Store the current angle and position of the robot
+        orientation = msg.pose.pose.orientation
+        self.current_angle = np.degrees(2 * np.arctan2(orientation.z, orientation.w))
+        self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
 
     def image_callback(self, msg):
         # Convert ROS Image message to OpenCV image
@@ -143,9 +153,6 @@ class TidyBotController(Node):
             self.twist.linear.x = 0.0
             self.twist.angular.z = 0.5
             self.velocity_publisher.publish(self.twist)
-            # Update the current angle based on angular velocity and time
-            self.current_angle += self.twist.angular.z * self.loopspeed
-            self.current_angle %= 360
 
         # Change state to SCANNING
         self.change_state("SCANNING")
@@ -177,75 +184,83 @@ class TidyBotController(Node):
         direction /= np.linalg.norm(direction)
         target_position = block_position - direction * 0.5
 
-        print(f"Moving to position {target_position} from position {self.current_position}")
-
         # Position the robot slightly behind the block
-        self.rotate_to_angle(np.degrees(np.arctan2(target_position[1] - self.current_position[1], target_position[0] - self.current_position[0])))
-        self.move_forward(np.hypot(target_position[0] - self.current_position[0], target_position[1] - self.current_position[1]))
-        
-        # Rotate robot to face the sign
-        angle_to_sign = np.degrees(np.arctan2(sign[2] - self.current_position[1], sign[1] - self.current_position[0]))
-        self.rotate_to_angle(angle_to_sign)
+        angle_offset = np.degrees(np.arctan2(target_position[1] - self.current_position[1], target_position[0] - self.current_position[0]))
+        distance_offset = np.hypot(target_position[0] - self.current_position[0], target_position[1] - self.current_position[1])
+        print(f"Rotating to angle {angle_offset} and moving forward {distance_offset}")
+        self.rotate_to_angle(angle_offset)
+        self.move_forward(distance_offset)
 
-        # Push the block towards the sign
-        distance_to_sign = np.hypot(sign[1] - block[1], sign[2] - block[2])
-        self.move_forward(distance_to_sign)
+        
+        # Rotate robot to face the sign, and then push the block towards the sign
+        angle_offset = np.degrees(np.arctan2(sign[2] - self.current_position[1], sign[1] - self.current_position[0]))
+        distance_offset = np.hypot(sign[1] - block[1], sign[2] - block[2])
+        print(f"Rotating to angle {angle_offset} and moving forward {distance_offset}")
+        self.rotate_to_angle(angle_offset)
+        self.move_forward(distance_offset)
 
         # Remove the block from the list of detected blocks, add it to the list of pushed blocks
         self.detected_blocks.remove(block)
         self.moved_blocks.append(block)
+
+        self.stop_movement()
+        print("Finished pushing block.")
+        self.change_state("FINISHED")
 
     def rotate_to_angle(self, target_angle):
         while abs((self.current_angle - target_angle + 180) % 360 - 180) > 2:
             self.twist.linear.x = 0.0
             self.twist.angular.z = 0.5 if ((target_angle - self.current_angle + 360) % 360) < 180 else -0.5
             self.velocity_publisher.publish(self.twist)
-            rclpy.spin_once(self, timeout_sec=self.loopspeed)  # Allow ROS to process odometry updates
+            rclpy.spin_once(self)
 
+        # Ensure the robot stops spinning after reaching the target angle
+        self.twist.angular.z = 0.0
+        self.velocity_publisher.publish(self.twist)
         self.stop_movement()
 
     def move_forward(self, distance):
         moved_distance = 0
-        while moved_distance < distance:
-            self.twist.linear.x = 0.3
-            self.twist.angular.z = 0.0
-            self.velocity_publisher.publish(self.twist)
+        start_position = self.current_position
+        if distance < 0:
+            self.stop_movement()
+            return
+        else:
+            while moved_distance < distance:
+                self.twist.linear.x = 0.5
+                self.twist.angular.z = 0.0
+                self.velocity_publisher.publish(self.twist)
+                rclpy.spin_once(self)
 
-            # Update position estimate
-            moved_distance += self.twist.linear.x * self.loopspeed
-            self.current_position = (
-                self.current_position[0] + self.twist.linear.x * self.loopspeed * np.cos(np.radians(self.current_angle)),
-                self.current_position[1] + self.twist.linear.x * self.loopspeed * np.sin(np.radians(self.current_angle))
-            )
-
-        self.stop_movement()
+                moved_distance = np.hypot(self.current_position[0] - start_position[0], self.current_position[1] - start_position[1])
+                print(f"Moved distance: {moved_distance} / {distance}")
+                
 
     def stop_movement(self):
         self.twist.linear.x = 0.0
         self.twist.angular.z = 0.0
         self.velocity_publisher.publish(self.twist)
 
-
     def scan(self):
-        self.twist.linear.x = 0.0
-        self.twist.angular.z = 0.5  # Spin in place
-        self.velocity_publisher.publish(self.twist)
+        print("Scanning for objects...")
+        start_angle = self.current_angle
+        while start_angle - self.current_angle < 360:
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 0.5  # Spin in place
+            self.velocity_publisher.publish(self.twist)
 
-        # Update the current angle based on angular velocity and time
-        self.current_angle += self.twist.angular.z * self.loopspeed
-        self.current_angle %= 360  # Keep angle within 0-360 degrees
+            # Check if any objects are detected, and if the appropriate sign location with the same color is known
+            if self.detected_blocks and self.detected_signs:
+                for block in self.detected_blocks:
+                    for sign in self.detected_signs:
+                        if block[0] == sign[0]:
+                            self.change_state("PUSHING")
+                            self.stop_movement()
+                            return
 
-        # Check if any objects are detected, and if the appropriate sign location with the same color is known
-        if self.detected_blocks and self.detected_signs:
-            for block in self.detected_blocks:
-                for sign in self.detected_signs:
-                    if block[0] == sign[0]:
-                        self.change_state("PUSHING")
-                        break
-
-        # Check if a full 360-degree spin has been completed
-        if abs(self.current_angle - 0.0) < 1e-2:  # Close to 0 degrees
-            self.change_state("ROAMING")
+        # Stop spinning and change state to ROAMING
+        self.stop_movement()
+        self.change_state("ROAMING")
 
     def finished(self):
         self.twist.linear.x = 0.0
@@ -260,11 +275,12 @@ class TidyBotController(Node):
             self.state = new_state
             print(f"State: {self.state}")
 
-    def control_loop(self):
+    def control_loop(self):       
+        
         #Print the detected objects and signs
-        print(f"Detected blocks: {self.detected_blocks}")
-        print(f"Detected signs: {self.detected_signs}")
-        print(f"Current state: {self.state}")        
+        #print(f"Detected blocks: {self.detected_blocks}")
+        #print(f"Detected signs: {self.detected_signs}")
+        #print(f"Current state: {self.state}")        
 
         # State machine logic with a switch-case statement
         if self.state == "ROAMING":
