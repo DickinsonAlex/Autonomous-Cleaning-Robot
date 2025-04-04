@@ -3,301 +3,308 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-import cv2
 from cv_bridge import CvBridge
+import cv2
 import numpy as np
 import time
+import math
 
+# Base class for detected objects
+class DetectedObject:
+    def __init__(self, type, x, y, color, timestamp=None):
+        self.obj_type = type
+        self.current_position = (x, y)
+        self.color = color
+        self.timestamp = timestamp if timestamp else time.time()
+
+    def is_same_color(self, other):
+        return self.color == other.color
+
+    def distance_to(self, other):
+        return math.hypot(self.current_position[0] - other.current_position[0], self.current_position[1] - other.current_position[1])
+
+    def update_position(self, x, y, timestamp=None):
+        self.current_position = (x, y)
+        self.timestamp = timestamp if timestamp else time.time()
+      
+class ObjectTracker:
+    def __init__(self):
+        self.blocks = []
+        self.signs = []
+        self.completed_colors = set()
+
+    def update_or_add(self, new_obj):
+        if new_obj.color in self.completed_colors:
+            return  # Skip already completed colors
+
+        obj_list = self.blocks if new_obj.obj_type == 'block' else self.signs
+        for existing in obj_list:
+            if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 0.5:
+                existing.update_position(*new_obj.current_position)
+                return
+        obj_list.append(new_obj)
+
+    def get_closest_pair(self):
+        # Return the closest unmatched block-sign pair of the same color
+        best_pair = None
+        best_distance = float('inf')
+        for block in self.blocks:
+            for sign in self.signs:
+                if block.is_same_color(sign) and block.color not in self.completed_colors:
+                    dist = block.distance_to(sign)
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_pair = (block, sign)
+        return best_pair
+
+    def all_blocks_moved(self):
+        # Check if all active colors have been completed
+        active_colors = set(block.color for block in self.blocks)
+        return active_colors.issubset(self.completed_colors)
+
+# Main controller node for TidyBot
 class TidyBotController(Node):
     def __init__(self):
         super().__init__('tidybot_controller')
-        
-        # Publisher to control robot velocity
-        self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
-        
-        # Subscribers for camera and LiDAR data
+        self.bridge = CvBridge()
+        self.state = 'SCANNING'
+        self.push_phase = "INIT"
+        self.tracker = ObjectTracker()
+        self.twist = Twist()
+
+        self.current_position = (0.0, 0.0)
+        self.current_angle = 0.0
+        self.lidar_data = []
+
+        self.scanning_started = False
+        self.scan_start_time = None
+
+        # ROS subscriptions and publisher
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
         self.create_subscription(LaserScan, 'scan', self.scan_callback, 10)
-
-        # Subscriber for odometry data
         self.create_subscription(Odometry, 'odom', self.odometry_callback, 10)
-        
-        # Timer to run the control loop
-        self.loopspeed = 1 # Control loop speed in seconds
-        self.timer = self.create_timer(self.loopspeed, self.control_loop)
-        
-        # Initialize Twist message for robot velocity
-        self.twist = Twist()
-        
-        # Initialize CvBridge for converting ROS Image messages to OpenCV images
-        self.bridge = CvBridge()
-        
-        # Variables to store processed data
-        self.detected_blocks = []  # List of detected blocks (color, x, y, z)
-        self.detected_signs = []   # List of detected signs (color, x, y, z)
-        self.moved_blocks = []     # List of blocks that have been moved to signs
-        self.lidar_data = None     # LiDAR data
-        
-        # State machine variables
-        self.state = "SCANNING" # Initial state
-
-        # Location Variables
-        self.current_angle = 0.0  # Initialize current angle
-        self.current_position = (0.0, 0.0)  # Initialize current position
-        self.last_object_detected_time = None  # Time when an object was last detected
+        self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.timer = self.create_timer(0.1, self.control_loop)
 
     def odometry_callback(self, msg):
-        # Store the current angle and position of the robot
-        orientation = msg.pose.pose.orientation
-        self.current_angle = np.degrees(2 * np.arctan2(orientation.z, orientation.w))
-        self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
-
-    def image_callback(self, msg):
-        # Convert ROS Image message to OpenCV image
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        
-        # Process image to detect objects
-        self.detect_objects(cv_image)
-
-        # Display image with detected objects
-        cv2.imshow('Image window', cv_image)
-        cv2.waitKey(1)
+        # Update robot position and orientation from odometry
+        self.current_position = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y
+        )
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        self.current_angle = math.degrees(2 * math.atan2(qz, qw))
 
     def scan_callback(self, msg):
-        # Store LiDAR data
+        # Store current LiDAR scan data
         self.lidar_data = msg.ranges
 
-    def detect_objects(self, image):
-        # Convert image to HSV color space
-        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
-        # Define color ranges for red and green objects
-        red_lower = np.array([0, 100, 100])
-        red_upper = np.array([10, 255, 255])
-        green_lower = np.array([50, 100, 100])
-        green_upper = np.array([70, 255, 255])
-        
-        # Create masks for red and green objects
-        red_mask = cv2.inRange(hsv_image, red_lower, red_upper)
-        green_mask = cv2.inRange(hsv_image, green_lower, green_upper)
-        
-        # Find contours of the objects
-        red_contours, _ = cv2.findContours(red_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                
-        # Check if LiDAR data is available
-        if self.lidar_data is None:
-                self.get_logger().warn("LiDAR data is not available. Skipping object detection for now.")
-                return
-    
-        # Ensure LiDAR data is valid before proceeding
-        if all(np.isinf(range_val) or range_val == 0 for range_val in self.lidar_data):
-            self.get_logger().warn("LiDAR data is invalid. Retrying object detection later.")
+    def image_callback(self, msg):
+        if not self.lidar_data:
             return
-        
-        # Classify objects based on color, size, and distance
-        for color, contours in [('red', red_contours), ('green', green_contours)]:
+
+        image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # Define HSV color ranges for detection
+        colors = {
+            'red': ([0, 100, 100], [10, 255, 255]),
+            'green': ([50, 100, 100], [70, 255, 255])
+        }
+
+        hfov = 90  # camera horizontal field of view in degrees
+
+        # Iterate over color masks and detect objects
+        for color, (lower, upper) in colors.items():
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
-                center_x = x + w // 2
-                center_y = y + h // 2
 
-                camera_hfov = 90  # Adjust based on camera's specs
-                angle = ((center_x / image.shape[1]) - 0.5) * camera_hfov # Approximate the angle of the object
-                distance = min(self.lidar_data[int(angle)], 10.0)  # Limit the distance to 10 meters
+                # Skip objects touching the image edge (not fully visible)
+                if x <= 0 or y <= 0 or x + w >= image.shape[1] - 1 or y + h >= image.shape[0] - 1:
+                    continue
 
-                # Calculate the estimated position of the object, using self.current_angle and self.current_position
-                world_x = self.current_position[0] + distance * np.cos(np.radians(self.current_angle + angle))
-                world_y = self.current_position[1] + distance * np.sin(np.radians(self.current_angle + angle))
+                cx = x + w // 2
+                cy = y + h // 2
+                angle_offset = ((cx / image.shape[1]) - 0.5) * hfov
+                index = int(len(self.lidar_data) * (angle_offset + hfov/2) / hfov)
 
-                # Using the y position guess if the object is a block or a sign
-                if center_y > image.shape[0] // 2:
-                    self.detected_blocks.append((color, world_x, world_y))
-                else:
-                    self.detected_signs.append((color, world_x, world_y))
-        
-            # Remove duplicate blocks
-            unique_blocks = []
-            for block in self.detected_blocks:
-                if not any(np.hypot(block[1]-b[1], block[2]-b[2]) < 0.5 and block[0]==b[0] for b in unique_blocks):
-                    unique_blocks.append(block)
-            self.detected_blocks = unique_blocks
+                if 0 <= index < len(self.lidar_data):
+                    distance = self.lidar_data[index]
+                    if distance == float('inf') or distance <= 0.1:
+                        continue
 
-            # Average the sign positions for each color
-            sign_positions = {}
-            for sign in self.detected_signs:
-                if sign[0] not in sign_positions:
-                    sign_positions[sign[0]] = []
-                sign_positions[sign[0]].append(sign[1:])
-            self.detected_signs = [(color, np.mean([pos[0] for pos in sign_positions[color]]), np.mean([pos[1] for pos in sign_positions[color]]) ) for color in sign_positions]
+                    abs_angle = math.radians(self.current_angle + angle_offset)
 
-    
-        # Update the last object detection time
-        if self.detected_blocks or self.detected_signs:
-            self.last_object_detected_time = time.time()
+                    obj_type = 'block' if cy > image.shape[0] // 2 else 'sign' # 
 
-    def roam(self):
-        # Move forward for 3 seconds or until about to hit an obstacle
-        start_time = time.time()
-        while time.time() - start_time < 3:
-            if self.lidar_data is not None:
-                if min(self.lidar_data) < 0.5:
-                    break
-            self.twist.linear.x = 0.5
-            self.twist.angular.z = 0.0
-            self.velocity_publisher.publish(self.twist)
+                    # Calculate world coordinates 
+                    if obj_type == 'block':
+                        world_x = self.current_position[0] + distance * math.cos(abs_angle)
+                        world_y = self.current_position[1] + distance * math.sin(abs_angle)
+                        obj = DetectedObject('block', world_x, world_y, color)
+                        self.tracker.update_or_add(obj)
+                    else:
+                        #signs can't rely on the distance from the lidar as blocks may be in the way
+                        #will need to use triangulation FILL CODE HERE    
+                        pass                  
 
-        # Rotate left 90 degrees
-        start_angle = self.current_angle
-        while abs(self.current_angle - start_angle) < 90:
+        # Show the processed image
+        cv2.imshow("TidyBot View", image)
+        cv2.waitKey(1)
+
+    def control_loop(self):
+        self._loop_count = getattr(self, '_loop_count', 0) + 1
+        if self._loop_count % 20 == 0:
+            #self.log_bot_info()
+            pass
+
+        state_handlers = {
+            'SCANNING': self.handle_scanning,
+            'PUSHING': self.handle_pushing,
+            'ROAMING': self.handle_roaming,
+            'FINISHED': self.handle_finished
+        }
+        state_handler = state_handlers.get(self.state)
+        if state_handler:
+            state_handler()
+
+    def handle_scanning(self):
+        if not self.scanning_started:
+            #self.get_logger().info("SCANNING: Starting rotation.")
+            self.scan_start_angle = self.current_angle
+            self.scanning_started = True
             self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5
-            self.velocity_publisher.publish(self.twist)
+            self.twist.angular.z = 1.0  # Set desired rotation speed
 
-        # Change state to SCANNING
-        self.change_state("SCANNING")
+        # Re-publish twist every loop to maintain motion
+        self.velocity_publisher.publish(self.twist)
 
-    def push(self):
-        if not self.detected_blocks or not self.detected_signs:
-            print("No blocks or signs detected.")
-            self.change_state("SCANNING")
+        # Check for early detection of both a block and a matching sign
+        pair = self.tracker.get_closest_pair()
+        if pair:
+            #self.get_logger().info("SCANNING: Found a valid block-sign pair early. Interrupting scan.")
+            self.stop()
+            self.scanning_started = False
+            self.target_block, self.target_sign = pair
+            self.state = 'PUSHING'
             return
 
-        # Find closest matching block and sign
-        closest_pair = min(
-            ((block, sign) for block in self.detected_blocks for sign in self.detected_signs if block[0] == sign[0]),
-            key=lambda pair: np.hypot(pair[0][1] - pair[1][1], pair[0][2] - pair[1][2]),
-            default=(None, None)
-        )
+        # Compute angle delta accounting for wraparound
+        delta = (self.current_angle - self.scan_start_angle + 360) % 360
+        #self.get_logger().info(f"SCANNING: Rotated {delta:.2f} degrees")
+        if delta >= 350:
+            #self.get_logger().info("SCANNING: Rotation complete.")
+            self.stop()
+            self.scanning_started = False
+            if pair:
+                #self.get_logger().info("SCANNING: Found a valid block-sign pair. Switching to PUSHING.")
+                self.target_block, self.target_sign = pair
+                self.state = 'PUSHING'
+            elif not self.tracker.blocks or not self.tracker.signs:
+                #self.get_logger().info("SCANNING: No valid block-sign pair. Switching to ROAMING.")
+                self.state = 'ROAMING'
 
-        block, sign = closest_pair
-        if not block or not sign:
-            print("No matching block-sign pair found.")
-            return
+    def handle_pushing(self):
+        if self.push_phase == "INIT":
+            self.get_logger().info("PUSHING: Planning route")
+            bx, by = self.target_block.current_position
+            sx, sy = self.target_sign.current_position
+            direction = np.array([sx - bx, sy - by])
+            direction = direction / np.linalg.norm(direction)
+            behind_block = bx - direction[0] * 0.5, by - direction[1] * 0.5
+            self.move_target = behind_block
+            self.push_phase = "MOVE_BEHIND"
+            self.arrived = False
+            self.rotation_done = False
 
-        print(f"Pushing block '{block} towards sign '{sign} from position {self.current_position}")
+            # Print the route
+            self.get_logger().info(f"Route: {self.current_position} -> {behind_block} -> {self.target_sign.current_position}")
+            self.get_logger().info(f"Block: {self.target_block.color} at {self.target_block.current_position}")
+            self.get_logger().info(f"Sign: {self.target_sign.color} at {self.target_sign.current_position}")
 
-        # Calculate vector from sign to block
-        target_position = np.array(sign[1:])
-        block_position = np.array(block[1:])
-        direction = target_position - block_position
-        direction /= np.linalg.norm(direction)
-        target_position = block_position - direction * 0.5
+        elif self.push_phase == "MOVE_BEHIND":
+            if not self.arrived:
+                self.arrived = self.move_to_target(self.move_target)
+            else:
+                self.push_phase = "PUSH_FORWARD"
+                self.move_target = self.target_sign.current_position
+                self.arrived = False
+                self.rotation_done = False
 
-        # Position the robot slightly behind the block
-        angle_offset = np.degrees(np.arctan2(target_position[1] - self.current_position[1], target_position[0] - self.current_position[0]))
-        distance_offset = np.hypot(target_position[0] - self.current_position[0], target_position[1] - self.current_position[1])
-        print(f"Rotating to angle {angle_offset} and moving forward {distance_offset}")
-        self.rotate_to_angle(angle_offset)
-        self.move_forward(distance_offset)
+        elif self.push_phase == "PUSH_FORWARD":
+            if not self.arrived:
+                self.arrived = self.move_to_target(self.move_target)
+            else:
+                self.get_logger().info("PUSHING: Complete")
+                self.stop()
+                self.tracker.completed_colors.add(self.target_block.color)
+                self.state = "SCANNING"
+                self.push_phase = "INIT"
 
-        
-        # Rotate robot to face the sign, and then push the block towards the sign
-        angle_offset = np.degrees(np.arctan2(sign[2] - self.current_position[1], sign[1] - self.current_position[0]))
-        distance_offset = np.hypot(sign[1] - block[1], sign[2] - block[2])
-        print(f"Rotating to angle {angle_offset} and moving forward {distance_offset}")
-        self.rotate_to_angle(angle_offset)
-        self.move_forward(distance_offset)
-
-        # Remove the block from the list of detected blocks, add it to the list of pushed blocks
-        self.detected_blocks.remove(block)
-        self.moved_blocks.append(block)
-
-        self.stop_movement()
-        print("Finished pushing block.")
-        self.change_state("FINISHED")
-
-    def rotate_to_angle(self, target_angle):
-        while abs((self.current_angle - target_angle + 180) % 360 - 180) > 2:
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5 if ((target_angle - self.current_angle + 360) % 360) < 180 else -0.5
-            self.velocity_publisher.publish(self.twist)
-            rclpy.spin_once(self)
-
-        # Ensure the robot stops spinning after reaching the target angle
+    def handle_roaming(self):
+        self.get_logger().info("State: ROAMING")
+        self.twist.linear.x = 0.3
         self.twist.angular.z = 0.0
         self.velocity_publisher.publish(self.twist)
-        self.stop_movement()
-
-    def move_forward(self, distance):
-        moved_distance = 0
-        start_position = self.current_position
-        if distance < 0:
-            self.stop_movement()
-            return
-        else:
-            while moved_distance < distance:
-                self.twist.linear.x = 0.5
-                self.twist.angular.z = 0.0
-                self.velocity_publisher.publish(self.twist)
-                rclpy.spin_once(self)
-
-                moved_distance = np.hypot(self.current_position[0] - start_position[0], self.current_position[1] - start_position[1])
-                print(f"Moved distance: {moved_distance} / {distance}")
-                
-
-    def stop_movement(self):
+        time.sleep(2)
         self.twist.linear.x = 0.0
-        self.twist.angular.z = 0.0
+        self.twist.angular.z = 0.5
         self.velocity_publisher.publish(self.twist)
+        time.sleep(2)
+        self.stop()
+        self.state = 'SCANNING'
 
-    def scan(self):
-        print("Scanning for objects...")
-        start_angle = self.current_angle
-        while start_angle - self.current_angle < 360:
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5  # Spin in place
-            self.velocity_publisher.publish(self.twist)
-
-            # Check if any objects are detected, and if the appropriate sign location with the same color is known
-            if self.detected_blocks and self.detected_signs:
-                for block in self.detected_blocks:
-                    for sign in self.detected_signs:
-                        if block[0] == sign[0]:
-                            self.change_state("PUSHING")
-                            self.stop_movement()
-                            return
-
-        # Stop spinning and change state to ROAMING
-        self.stop_movement()
-        self.change_state("ROAMING")
-
-    def finished(self):
-        self.twist.linear.x = 0.0
-        self.twist.angular.z = 0.0
-        self.velocity_publisher.publish(self.twist)
-        self.get_logger().info("Exploration finished.")
+    def handle_finished(self):
+        self.get_logger().info("State: FINISHED")
+        self.stop()
         self.destroy_node()
         rclpy.shutdown()
-        
-    def change_state(self, new_state):
-        if self.state != new_state:
-            self.state = new_state
-            print(f"State: {self.state}")
 
-    def control_loop(self):       
-        
-        #Print the detected objects and signs
-        #print(f"Detected blocks: {self.detected_blocks}")
-        #print(f"Detected signs: {self.detected_signs}")
-        #print(f"Current state: {self.state}")        
+    def move_to_target(self, target):
+        tx, ty = target
+        dx = tx - self.current_position[0]
+        dy = ty - self.current_position[1]
+        distance = math.hypot(dx, dy)
 
-        # State machine logic with a switch-case statement
-        if self.state == "ROAMING":
-            self.roam()
-        elif self.state == "PUSHING":
-            self.push()
-        elif self.state == "SCANNING":
-            self.scan()
-        elif self.state == "FINISHED":
-            self.finished()            
+        if distance < 0.05:
+            self.stop()
+            return True
 
+        target_angle = math.degrees(math.atan2(dy, dx)) % 360
+        angle_diff = (target_angle - self.current_angle + 360) % 360
+        if angle_diff > 180:
+            angle_diff -= 360
+
+        if abs(angle_diff) > 5:
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 0.5 if angle_diff > 0 else -0.5
+        else:
+            self.twist.linear.x = 0.3
+            self.twist.angular.z = 0.0
+
+        self.velocity_publisher.publish(self.twist)
+        return False
+
+    def stop(self):
+        # Stop all robot motion
+        self.twist.linear.x = 0.0
+        self.twist.angular.z = 0.0
+        self.velocity_publisher.publish(self.twist)
+
+    def log_bot_info(self):
+        block_colors = [b.color for b in self.tracker.blocks if b.color not in self.tracker.completed_colors]
+        sign_colors = [s.color for s in self.tracker.signs]
+        self.get_logger().info(f"\nCurrent State: {self.state} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBlocks: {block_colors} \nSigns: {sign_colors}")
+
+# Main entry point
 def main(args=None):
     rclpy.init(args=args)
     node = TidyBotController()
     rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
