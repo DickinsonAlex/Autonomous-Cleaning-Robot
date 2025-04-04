@@ -31,6 +31,7 @@ class ObjectTracker:
     def __init__(self):
         self.blocks = []
         self.signs = []
+        self.signs_angles = []
         self.completed_colors = set()
 
     def update_or_add(self, new_obj):
@@ -44,6 +45,35 @@ class ObjectTracker:
                 return
         obj_list.append(new_obj)
 
+    def add_sign_angle(self, color, position, angle):
+
+        if any(s[0] == color and s[1] == position for s in self.signs_angles):
+            # If the color and position already exist in the signs_angles list, we can skip adding it
+            return
+        
+        if any(s.color == color for s in self.signs):
+            # If the color is already in the signs list, we can skip adding it to the signs_angles
+            return
+
+        # Add the colour, recorded position, and sign angle to the signs_angles
+        self.signs_angles.append((color, position, angle))
+
+        # If theres three angles of the same color, we can triangulate the position and add it to the signs, and remove the angles
+        if len([s for s in self.signs_angles if s[0] == color]) >= 3:
+            # Triangulate the position of the sign
+            positions = [s[1] for s in self.signs_angles if s[0] == color]
+            angles = [s[2] for s in self.signs_angles if s[0] == color]
+            avg_x = sum(p[0] for p in positions) / len(positions)
+            avg_y = sum(p[1] for p in positions) / len(positions)
+            avg_angle = sum(angles) / len(angles)
+
+            # Create a new sign object and add it to the signs list
+            new_sign = DetectedObject('sign', avg_x, avg_y, color)
+            self.update_or_add(new_sign)
+
+            # Remove the angles from the list
+            self.signs_angles = [s for s in self.signs_angles if s[0] != color]
+        
     def get_closest_pair(self):
         # Return the closest unmatched block-sign pair of the same color
         best_pair = None
@@ -72,12 +102,14 @@ class TidyBotController(Node):
         self.tracker = ObjectTracker()
         self.twist = Twist()
 
+        self.scan_state = "None"
+        self.starting_angle = 0.0
+        self.scan_stage = 0
+        self.scan_points = []
+
         self.current_position = (0.0, 0.0)
         self.current_angle = 0.0
         self.lidar_data = []
-
-        self.scanning_started = False
-        self.scan_start_time = None
 
         # ROS subscriptions and publisher
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
@@ -100,6 +132,7 @@ class TidyBotController(Node):
         # Store current LiDAR scan data
         self.lidar_data = msg.ranges
 
+    ### Image callback to process camera images in conjunction with LiDAR data
     def image_callback(self, msg):
         if not self.lidar_data:
             return
@@ -148,14 +181,19 @@ class TidyBotController(Node):
                         obj = DetectedObject('block', world_x, world_y, color)
                         self.tracker.update_or_add(obj)
                     else:
-                        #signs can't rely on the distance from the lidar as blocks may be in the way
-                        #will need to use triangulation FILL CODE HERE    
+                        # Skip if the sign is a completed color
+                        if color not in self.tracker.completed_colors:
+                            #signs can't rely on the distance from the lidar as blocks may be in the way
+                            self.tracker.add_sign_angle(color, self.current_position, abs_angle)
                         pass                  
 
         # Show the processed image
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
 
+    ### CONTROL LOOP ###
+    # This is the main control loop that runs at a fixed rate
+    # It checks the current state of the robot and calls the appropriate handler
     def control_loop(self):
         self._loop_count = getattr(self, '_loop_count', 0) + 1
         if self._loop_count % 20 == 0:
@@ -172,45 +210,61 @@ class TidyBotController(Node):
         if state_handler:
             state_handler()
 
+    ### SCANNING STATE ###
+    # In this state, the robot spins in place 360, noting down the location of blocks, and angle of signs.
+    # It will do this three times, in a small triangle, so that it can record three angles for each sign.
+    # Once there are three angles, it will triangulate the location of the sign.
+    # If it finds a block and a sign of the same color, it will stop scanning and move to the pushing state.
+    # If it does not find a pair, it will stop scanning and move to the roaming state.
     def handle_scanning(self):
-        if not self.scanning_started:
-            #self.get_logger().info("SCANNING: Starting rotation.")
-            self.scan_start_angle = self.current_angle
-            self.scanning_started = True
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 1.0  # Set desired rotation speed
+        if self.scan_stage == 0:
+            self.scan_points = [self.current_position] #First point is the center
+            # Add the three points of the triangle
+            for i in range(3):
+                angle = math.radians(i * 120)
+                x = self.current_position[0] + 0.2 * math.cos(angle)
+                y = self.current_position[1] + 0.2 * math.sin(angle)
+                self.scan_points.append((x, y))
+            self.scan_stage = 1
+        elif self.scan_stage <= 3:
+            # Check if we have reached the next scan point
+            if self.move_to_target(self.scan_points[self.scan_stage]):
+                if self.scan_state == "None":
+                    # We must have just arrived at the next point
+                    self.get_logger().info("Reached scan point " + str(self.scan_stage) + " out of 3")
+                    self.scan_start_angle = self.current_angle
+                    self.scan_state = "In-Progress"
+                elif self.scan_state == "In-Progress":
+                    # We are at the next point, so we can start scanning
+                    self.twist.linear.x = 0.0
+                    self.twist.angular.z = 1.0  # Set desired rotation speed
+                    self.velocity_publisher.publish(self.twist) # Re-publish twist every loop to maintain motion
 
-        # Re-publish twist every loop to maintain motion
-        self.velocity_publisher.publish(self.twist)
-
-        # Check for early detection of both a block and a matching sign
-        pair = self.tracker.get_closest_pair()
-        if pair:
-            #self.get_logger().info("SCANNING: Found a valid block-sign pair early. Interrupting scan.")
+                    if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350: # If we have rotated 360 degrees
+                        # We have completed the scan
+                        self.scan_state = "Finished"
+                if self.scan_state == "Finished":
+                    # If we have completed the scan, we can move onto the next point
+                    self.get_logger().info("Completed scan stage " + str(self.scan_stage))
+                    self.scan_state = "None"
+                    self.scan_stage += 1
+        else:
+            # We have completed the scan, so we can stop
+            self.scan_stage = 0
+            self.scan_state = "None"
             self.stop()
-            self.scanning_started = False
-            self.target_block, self.target_sign = pair
-            self.state = 'PUSHING'
-            return
 
-        # Compute angle delta accounting for wraparound
-        delta = (self.current_angle - self.scan_start_angle + 360) % 360
-        #self.get_logger().info(f"SCANNING: Rotated {delta:.2f} degrees")
-        if delta >= 350:
-            #self.get_logger().info("SCANNING: Rotation complete.")
-            self.stop()
-            self.scanning_started = False
+            # Check if we have found a pair of blocks and signs
+            pair = self.tracker.get_closest_pair()
             if pair:
-                #self.get_logger().info("SCANNING: Found a valid block-sign pair. Switching to PUSHING.")
-                self.target_block, self.target_sign = pair
+                self.target_block = pair[0]
+                self.target_sign = pair[1]
+                self.get_logger().info(f"Found pair: Block {self.target_block.color} at {self.target_block.current_position}, Sign {self.target_sign.color} at {self.target_sign.current_position}")
                 self.state = 'PUSHING'
-            elif not self.tracker.blocks or not self.tracker.signs:
-                #self.get_logger().info("SCANNING: No valid block-sign pair. Switching to ROAMING.")
-                self.state = 'ROAMING'
 
     def handle_pushing(self):
         if self.push_phase == "INIT":
-            self.get_logger().info("PUSHING: Planning route")
+            self.get_logger().info("Planning route")
             bx, by = self.target_block.current_position
             sx, sy = self.target_sign.current_position
             direction = np.array([sx - bx, sy - by])
@@ -221,12 +275,8 @@ class TidyBotController(Node):
             self.arrived = False
             self.rotation_done = False
 
-            # Print the route
-            self.get_logger().info(f"Route: {self.current_position} -> {behind_block} -> {self.target_sign.current_position}")
-            self.get_logger().info(f"Block: {self.target_block.color} at {self.target_block.current_position}")
-            self.get_logger().info(f"Sign: {self.target_sign.color} at {self.target_sign.current_position}")
-
         elif self.push_phase == "MOVE_BEHIND":
+            self.get_logger().info("Moving behind block")
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
             else:
@@ -236,6 +286,7 @@ class TidyBotController(Node):
                 self.rotation_done = False
 
         elif self.push_phase == "PUSH_FORWARD":
+            self.get_logger().info("Pushing block")
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
             else:
@@ -246,7 +297,7 @@ class TidyBotController(Node):
                 self.push_phase = "INIT"
 
     def handle_roaming(self):
-        self.get_logger().info("State: ROAMING")
+        self.get_logger().info("Roaming")
         self.twist.linear.x = 0.3
         self.twist.angular.z = 0.0
         self.velocity_publisher.publish(self.twist)
