@@ -9,10 +9,11 @@ import numpy as np
 import time
 import math
 
+# Class representing a detected object (either a block or a sign)
 class DetectedObject:
     def __init__(self, type, x, y, color, timestamp=None):
-        self.obj_type = type
-        self.current_position = (x, y)
+        self.obj_type = type  # 'block' or 'sign'
+        self.current_position = (x, y)  # (x, y) world coordinates
         self.color = color
         self.timestamp = timestamp if timestamp else time.time()
 
@@ -20,12 +21,16 @@ class DetectedObject:
         return self.color == other.color
 
     def distance_to(self, other):
-        return math.hypot(self.current_position[0] - other.current_position[0], self.current_position[1] - other.current_position[1])
+        # Euclidean distance to another object
+        return math.hypot(self.current_position[0] - other.current_position[0],
+                          self.current_position[1] - other.current_position[1])
 
     def update_position(self, x, y, timestamp=None):
+        # Update object's world position and timestamp
         self.current_position = (x, y)
         self.timestamp = timestamp if timestamp else time.time()
 
+# Tracks and manages detected blocks and signs
 class ObjectTracker:
     def __init__(self):
         self.blocks = []
@@ -34,6 +39,7 @@ class ObjectTracker:
         self.completed_colors = set()
 
     def update_or_add(self, new_obj):
+        # Ignore if color is already completed
         if new_obj.color in self.completed_colors:
             return
         obj_list = self.blocks if new_obj.obj_type == 'block' else self.signs
@@ -50,6 +56,7 @@ class ObjectTracker:
             return
         self.signs_angles.append((color, position, angle))
         if len([s for s in self.signs_angles if s[0] == color]) >= 3:
+            # Triangulate sign location from multiple sightings
             positions = [s[1] for s in self.signs_angles if s[0] == color]
             avg_x = sum(p[0] for p in positions) / len(positions)
             avg_y = sum(p[1] for p in positions) / len(positions)
@@ -58,6 +65,7 @@ class ObjectTracker:
             self.signs_angles = [s for s in self.signs_angles if s[0] != color]
 
     def get_closest_pair(self):
+        # Find the closest matching block-sign color pair
         best_pair = None
         best_distance = float('inf')
         for block in self.blocks:
@@ -73,28 +81,35 @@ class ObjectTracker:
         active_colors = set(block.color for block in self.blocks)
         return active_colors.issubset(self.completed_colors)
 
+# Main controller class for TidyBot
 class TidyBotController(Node):
     def __init__(self):
         super().__init__('tidybot_controller')
         self.bridge = CvBridge()
         self.state = 'SCANNING'
-        self.push_phase = "INIT"
+        self.push_phase = 'INIT'
         self.tracker = ObjectTracker()
         self.twist = Twist()
-        self.scan_state = "None"
-        self.starting_angle = 0.0
+        self.scan_state = 'None'
         self.scan_stage = 0
         self.scan_points = []
         self.current_position = (0.0, 0.0)
         self.current_angle = 0.0
         self.lidar_data = []
+
+        # Subscriptions
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
+
+        # Publisher
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        # Loop timer
         self.timer = self.create_timer(0.1, self.control_loop)
 
     def odometry_callback(self, msg):
+        # Convert odometry pose to position and yaw angle
         self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
@@ -112,7 +127,8 @@ class TidyBotController(Node):
             'red': ([0, 100, 100], [10, 255, 255]),
             'green': ([50, 100, 100], [70, 255, 255])
         }
-        hfov = 90
+        hfov = 90  # Camera horizontal field of view
+
         for color, (lower, upper) in colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -123,28 +139,30 @@ class TidyBotController(Node):
                 cx = x + w // 2
                 cy = y + h // 2
                 angle_offset = ((cx / image.shape[1]) - 0.5) * hfov
-                index = int(len(self.lidar_data) * (angle_offset + hfov/2) / hfov)
+                index = int(len(self.lidar_data) * (angle_offset + hfov / 2) / hfov)
                 if 0 <= index < len(self.lidar_data):
                     distance = self.lidar_data[index]
                     if distance == float('inf') or distance <= 0.1:
                         continue
                     abs_angle = math.radians(self.current_angle + angle_offset)
+                    world_x = self.current_position[0] + distance * math.cos(abs_angle)
+                    world_y = self.current_position[1] + distance * math.sin(abs_angle)
                     if cy > image.shape[0] // 2:
-                        world_x = self.current_position[0] + distance * math.cos(abs_angle)
-                        world_y = self.current_position[1] + distance * math.sin(abs_angle)
                         obj = DetectedObject('block', world_x, world_y, color)
                         self.tracker.update_or_add(obj)
                     else:
                         if color not in self.tracker.completed_colors:
                             self.tracker.add_sign_angle(color, self.current_position, abs_angle)
+
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
 
     def control_loop(self):
         self._loop_count = getattr(self, '_loop_count', 0) + 1
         if self._loop_count % 20 == 0:
-            #self.log_bot_info() # Log every 2 seconds
-            pass
+            self.log_bot_info()  # Log bot info every 2 seconds
+
+        # FSM state handler map
         state_handlers = {
             'SCANNING': self.handle_scanning,
             'PUSHING': self.handle_pushing,
@@ -155,10 +173,9 @@ class TidyBotController(Node):
         if state_handler:
             state_handler()
 
-        
-
     def handle_scanning(self):
         if self.scan_stage == 0:
+            # Generate three scan points in a circle
             self.scan_points = [self.current_position]
             for i in range(3):
                 angle = math.radians(i * 120)
@@ -181,6 +198,7 @@ class TidyBotController(Node):
                     self.scan_state = "None"
                     self.scan_stage += 1
         else:
+            # All scan points visited, transition
             self.scan_stage = 0
             self.scan_state = "None"
             self.stop()
@@ -192,6 +210,7 @@ class TidyBotController(Node):
 
     def handle_pushing(self):
         if self.push_phase == "INIT":
+            # Compute direction and target behind block
             bx, by = self.target_block.current_position
             sx, sy = self.target_sign.current_position
             direction = np.array([sx - bx, sy - by])
@@ -201,20 +220,16 @@ class TidyBotController(Node):
                 self.state = "SCANNING"
                 return
             direction = direction / norm
-            behind_block = bx - direction[0] * 0.5, by - direction[1] * 0.5
-            self.move_target = behind_block
+            self.move_target = bx - direction[0] * 0.5, by - direction[1] * 0.5
             self.push_phase = "MOVE_BEHIND"
             self.arrived = False
-            self.rotation_done = False
         elif self.push_phase == "MOVE_BEHIND":
-            
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
             else:
                 self.push_phase = "PUSH_FORWARD"
                 self.move_target = self.target_sign.current_position
                 self.arrived = False
-                self.rotation_done = False
         elif self.push_phase == "PUSH_FORWARD":
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
@@ -246,6 +261,7 @@ class TidyBotController(Node):
         rclpy.shutdown()
 
     def move_to_target(self, target):
+        # Rotate to face the target and drive toward it
         tx, ty = target
         dx = tx - self.current_position[0]
         dy = ty - self.current_position[1]
@@ -267,14 +283,18 @@ class TidyBotController(Node):
         return False
 
     def stop(self):
+        # Stop robot motion
         self.twist.linear.x = 0.0
         self.twist.angular.z = 0.0
         self.velocity_publisher.publish(self.twist)
 
     def log_bot_info(self):
+        # Debug logging of state and tracked objects
         block_colors = [b.color for b in self.tracker.blocks if b.color not in self.tracker.completed_colors]
         sign_colors = [s.color for s in self.tracker.signs]
         self.get_logger().info(f"\nCurrent State: {self.state} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBlocks: {block_colors} \nSigns: {sign_colors}")
+
+# Entry point
 
 def main(args=None):
     rclpy.init(args=args)
