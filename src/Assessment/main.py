@@ -9,11 +9,41 @@ import numpy as np
 import time
 import math
 
+# This class subscribes to the /odom topic and logs the position and orientation of the robot.
+# Testing confirms testting area is between -0.1 and 0.1 for both x and y coordinates.
+class OdomTracker:
+    def __init__(self, node):
+        self.node = node  # Parent node to create the subscriber
+        self.position = (0.0, 0.0)
+        self.yaw = 0.0
+
+        self.node.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+    def odom_callback(self, msg):
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        yaw = math.degrees(2 * math.atan2(qz, qw))
+
+        self.position = (x, y)
+        self.yaw = yaw
+
+    def get_position(self):
+        return self.position
+
+    def get_yaw(self):
+        return self.yaw
+
+    def log_info(self):
+        x, y = self.position
+        self.node.get_logger().info(f"[OdomTracker] Position: ({x:.2f}, {y:.2f}) | Yaw: {self.yaw:.2f}°")
+
 # Class to represent each detected object (either a box or a marker)
 class DetectedObject:
     def __init__(self, type, x, y, color, timestamp=None):
         self.obj_type = type  # Either 'box' or 'marker'
-        self.current_position = (x, y)
+        self.position = (x, y)
         self.color = color
         self.timestamp = timestamp if timestamp else time.time()
 
@@ -21,11 +51,11 @@ class DetectedObject:
         return self.color == other.color
 
     def distance_to(self, other):
-        return math.hypot(self.current_position[0] - other.current_position[0],
-                          self.current_position[1] - other.current_position[1])
+        return math.hypot(self.position[0] - other.position[0],
+                          self.position[1] - other.position[1])
 
     def update_position(self, x, y, timestamp=None):
-        self.current_position = (x, y)
+        self.position = (x, y)
         self.timestamp = timestamp if timestamp else time.time()
 
 # Object tracker that stores seen boxes and markers, manages duplicates and pairing
@@ -42,7 +72,7 @@ class ObjectTracker:
         for existing in obj_list:
             if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 1:
                 # If close enough and same color, update
-                existing.update_position(*new_obj.current_position)
+                existing.update_position(*new_obj.position)
                 return
 
         # Otherwise it's a new object
@@ -101,24 +131,20 @@ class TidyBotController(Node):
         self.scan_points = []
 
         # === Odometry vars ===
-        self.current_position = (0.0, 0.0)
-        self.current_angle = 0.0
+        self.odom = OdomTracker(self)
+        self.create_timer(2.0, self.odom.log_info)
+        
+        ## === LIDAR vars ===
         self.lidar_data = []
 
         # === ROS Subscribers and Publishers ===
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-        self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
         self.timer = self.create_timer(0.1, self.control_loop)
 
-    # Callback for updating the robot's position and orientation
-    def odometry_callback(self, msg):
-        self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        # Estimate current yaw angle in degrees from quaternion
-        self.current_angle = math.degrees(2 * math.atan2(qz, qw))
+        # === State Variables ===
+        self.create_timer(2.0, self.log_bot_info)
 
     # Callback to update LIDAR data
     def scan_callback(self, msg):
@@ -164,9 +190,9 @@ class TidyBotController(Node):
                     if distance == float('inf') or distance <= 0.1:
                         continue
 
-                    abs_angle = math.radians(self.current_angle + angle_offset)
-                    world_x = self.current_position[0] + distance * math.cos(abs_angle)
-                    world_y = self.current_position[1] + distance * math.sin(abs_angle)
+                    abs_angle = math.radians(self.odom.get_yaw() + angle_offset)
+                    world_x = self.odom.get_position()[0] + distance * math.cos(abs_angle)
+                    world_y = self.odom.get_position()[1] + distance * math.sin(abs_angle)
 
                     # Lower half of image = box; upper = marker
                     if cy > image.shape[0] // 2:
@@ -174,7 +200,7 @@ class TidyBotController(Node):
                         self.tracker.update_or_add(obj)
                     else:
                         if color not in self.tracker.completed_colors:
-                            self.tracker.add_marker_angle(color, self.current_position, abs_angle)
+                            self.tracker.add_marker_angle(color, self.odom.get_position(), abs_angle)
 
         # Debug visualization
         cv2.imshow("TidyBot View", image)
@@ -182,10 +208,6 @@ class TidyBotController(Node):
 
     # Main control loop dispatches based on state
     def control_loop(self):
-        self._loop_count = getattr(self, '_loop_count', 0) + 1
-        if self._loop_count % 20 == 0:
-            self.log_bot_info()  # Log bot info every 2 seconds
-
         # FSM state handler map
         state_handlers = {
             'SCANNING': self.handle_scanning,
@@ -200,18 +222,18 @@ class TidyBotController(Node):
     # === SCANNING: Move in triangle and rotate to detect objects ===
     def handle_scanning(self):
         if self.scan_stage == 0:
-            self.scan_points = [self.current_position]
+            self.scan_points = [self.odom.get_position()]
             for i in range(3):
                 angle = math.radians(i * 120)
-                x = self.current_position[0] + 0.2 * math.cos(angle)
-                y = self.current_position[1] + 0.2 * math.sin(angle)
+                x = self.odom.get_position()[0] + 0.2 * math.cos(angle)
+                y = self.odom.get_position()[1] + 0.2 * math.sin(angle)
                 self.scan_points.append((x, y))
             self.scan_stage = 1
 
         elif self.scan_stage <= 3:
             if self.move_to_target(self.scan_points[self.scan_stage]):
                 if self.scan_state == "None":
-                    self.scan_start_angle = self.current_angle
+                    self.scan_start_angle = self.odom.get_yaw()
                     self.scan_state = "In-Progress"
 
                 elif self.scan_state == "In-Progress":
@@ -219,7 +241,7 @@ class TidyBotController(Node):
                     self.twist.linear.x = 0.0
                     self.twist.angular.z = 1.0
                     self.velocity_publisher.publish(self.twist)
-                    if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
+                    if (self.odom.get_yaw() - self.scan_start_angle + 360) % 360 >= 350:
                         self.scan_state = "Finished"
 
                 if self.scan_state == "Finished":
@@ -273,7 +295,6 @@ class TidyBotController(Node):
 
         self.get_logger().info(f"Current phase: {self.push_phase}")
         self.get_logger().info(f"Moving to {self.move_target}")
-        self.get_logger().info(f"Current position: {self.current_position}")
 
     # === ROAMING: Random motion used during testing ===
     def handle_roaming(self):
@@ -297,8 +318,8 @@ class TidyBotController(Node):
     # === Helper for moving to target point with rotation logic ===
     def move_to_target(self, target):
         tx, ty = target
-        dx = tx - self.current_position[0]
-        dy = ty - self.current_position[1]
+        dx = tx - self.odom.get_position()[0]
+        dy = ty - self.odom.get_position()[1]
 
         distance = math.hypot(dx, dy)
         if distance < 0.2:
@@ -306,7 +327,7 @@ class TidyBotController(Node):
             return True
 
         target_angle = math.degrees(math.atan2(dy, dx)) % 360
-        angle_diff = (target_angle - self.current_angle + 360) % 360
+        angle_diff = (target_angle - self.odom.get_yaw() + 360) % 360
         if angle_diff > 180:
             angle_diff -= 360
 
@@ -330,12 +351,14 @@ class TidyBotController(Node):
     def log_bot_info(self):
         box_colors = [b.color for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
         marker_colors = [s.color for s in self.tracker.markers]
-        self.get_logger().info(f"\nCurrent State: {self.state} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
+        self.get_logger().info(f"\nCurrent State: {self.state} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = TidyBotController()
     rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
