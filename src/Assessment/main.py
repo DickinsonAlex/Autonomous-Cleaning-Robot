@@ -349,9 +349,16 @@ class TidyBotController(Node):
 
     # Debug printout for state, box status, and marker positions
     def log_bot_info(self):
+        box_positions = [b.position for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
         box_colors = [b.color for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
+        
+        marker_positions = [m.position for m in self.tracker.markers]
         marker_colors = [s.color for s in self.tracker.markers]
-        self.get_logger().info(f"\nCurrent State: {self.state} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
+
+        box_info = [f"{color}: {pos}" for color, pos in zip(box_colors, box_positions)]
+        marker_info = [f"{color}: {pos}" for color, pos in zip(marker_colors, marker_positions)]
+
+        self.get_logger().info(f"[State] Current State: {self.state} \n[Boxes] {box_info} \n[Markers] {marker_info}")
 
 def main(args=None):
     rclpy.init(args=args)
