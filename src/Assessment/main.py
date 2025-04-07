@@ -179,28 +179,37 @@ class TidyBotController(Node):
 
                 cx = x + w // 2
                 cy = y + h // 2
-                angle_offset = ((cx / image.shape[1]) - 0.5) * hfov
+                image_width = image.shape[1]
 
-                # Map pixel to LIDAR index
-                index = int(len(self.lidar_data) * (angle_offset + hfov / 2) / hfov)
+                # Calculate relative angle in radians (centered around 0)
+                angle_offset_deg = ((cx / image_width) - 0.5) * hfov
+                angle_offset_rad = math.radians(angle_offset_deg)
 
-                if 0 <= index < len(self.lidar_data):
-                    distance = self.lidar_data[index]
+                # Robot’s current yaw (global), converted to radians
+                yaw_rad = math.radians(self.odom.get_yaw())
 
-                    if distance == float('inf') or distance <= 0.1:
-                        continue
+                # Final angle relative to world
+                abs_angle = yaw_rad + angle_offset_rad
 
-                    abs_angle = math.radians(self.odom.get_yaw() + angle_offset)
-                    world_x = self.odom.get_position()[0] + distance * math.cos(abs_angle)
-                    world_y = self.odom.get_position()[1] + distance * math.sin(abs_angle)
+                # Calculate corresponding LIDAR index using angle offset (not global yaw!)
+                lidar_index = int((angle_offset_deg + (hfov / 2)) / hfov * len(self.lidar_data))
+                lidar_index = max(0, min(lidar_index, len(self.lidar_data) - 1))
 
-                    # Lower half of image = box; upper = marker
-                    if cy > image.shape[0] // 2:
-                        obj = DetectedObject('box', world_x, world_y, color)
-                        self.tracker.update_or_add(obj)
-                    else:
-                        if color not in self.tracker.completed_colors:
-                            self.tracker.add_marker_angle(color, self.odom.get_position(), abs_angle)
+                distance = self.lidar_data[lidar_index]
+                if distance == float('inf') or distance <= 0.1:
+                    continue
+
+                # Convert to global world position
+                world_x = self.odom.get_position()[0] + distance * math.cos(abs_angle)
+                world_y = self.odom.get_position()[1] + distance * math.sin(abs_angle)
+
+                # Lower half of image = box; upper = marker
+                if cy > image.shape[0] // 2:
+                    obj = DetectedObject('box', world_x, world_y, color)
+                    self.tracker.update_or_add(obj)
+                else:
+                    if color not in self.tracker.completed_colors:
+                        self.tracker.add_marker_angle(color, self.odom.get_position(), abs_angle)
 
         # Debug visualization
         cv2.imshow("TidyBot View", image)
@@ -260,8 +269,8 @@ class TidyBotController(Node):
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
         if self.push_phase == "INIT":
-            bx, by = self.target_box.current_position
-            sx, sy = self.target_marker.current_position
+            bx, by = self.target_box.position
+            sx, sy = self.target_marker.position
 
             direction = np.array([sx - bx, sy - by])
             norm = np.linalg.norm(direction)
@@ -281,7 +290,7 @@ class TidyBotController(Node):
                 self.arrived = self.move_to_target(self.move_target)
             else:
                 self.push_phase = "PUSH_FORWARD"
-                self.move_target = self.target_marker.current_position
+                self.move_target = self.target_marker.position
                 self.arrived = False
 
         elif self.push_phase == "PUSH_FORWARD":
