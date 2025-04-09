@@ -198,12 +198,10 @@ class TidyBotController(Node):
             (cx - half, cy - half)   # Bottom-left
         ]
 
-
-
     # Using known locations, plot the boxes and markers on a minimap
     def minimap_callback(self):
-        cv2.namedWindow("Minimap [Debug]", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Minimap [Debug]", 640, 480)
+        cv2.namedWindow("Debug Screen", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Debug Screen", 640, 480)
         map_image = np.zeros((500, 600, 3), dtype=np.uint8)
         map_image[:] = (200, 200, 200)
 
@@ -244,8 +242,45 @@ class TidyBotController(Node):
             color = (0, 255, 0) if obj.color == 'green' else (0, 0, 255)
             label = 'Box' if obj.obj_type == 'box' else 'Pushed Box'
             cv2.circle(map_image, (ox, oy), 5, color, -1)
-            cv2.putText(map_image, label, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(map_image, label, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
+        # Draw out the Targets
+        if self.state == 'PUSHING':
+            if hasattr(self, 'move_target'):
+                tx, ty = self.move_target
+                tx = int(tx * minimap_scale) + center_x
+                ty = int(-ty * minimap_scale) + center_y
+                cv2.circle(map_image, (tx, ty), 5, (255, 0, 255), -1)
+                cv2.putText(map_image, '1', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+                # Draw line between robot and move target
+                cv2.line(map_image, (rx, ry), (tx, ty), (255, 255, 255), 3)
+
+                if hasattr(self, 'target_box'):
+                    bx = int(self.target_box.current_position[0] * minimap_scale) + center_x
+                    by = int(-self.target_box.current_position[1] * minimap_scale) + center_y
+                    cv2.circle(map_image, (bx, by), 5, (255, 0, 0), -1)
+                    cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+                    # Draw line between move target and box
+                    cv2.line(map_image, (tx, ty), (bx, by), (255, 255, 255), 3)
+
+                    if hasattr(self, 'target_marker'):
+                        mx = int(self.target_marker.current_position[0] * minimap_scale) + center_x
+                        my = int(-self.target_marker.current_position[1] * minimap_scale) + center_y
+                        cv2.circle(map_image, (mx, my), 5, (255, 255, 0), -1)
+                        cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+                        # Draw line between box and marker
+                        cv2.line(map_image, (bx, by), (mx, my), (255, 255, 255), 3)
+
+
+        # In the top left, draw the current state
+        cv2.putText(map_image, f"State: {self.state}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Phase: {self.phase}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Position: {self.current_position}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Angle: {math.degrees(self.current_angle):.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        
         # Draw walls by color on correct square side
         for color, marker in self.wall_markers.items():
             if marker:
@@ -273,6 +308,7 @@ class TidyBotController(Node):
 
                     wall_color = (0, 255, 0) if color == 'green' else (0, 0, 255)
                     cv2.line(map_image, (x1, y1), (x2, y2), wall_color, 3)
+                    cv2.putText(map_image, f"{color.capitalize()} Wall", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
 
         cv2.imshow("Minimap [Debug]", map_image)
@@ -388,6 +424,7 @@ class TidyBotController(Node):
                 self.stop()
                 self.state = "SCANNING"
                 self.phase = "None"
+                self.pushed_boxes.append(self.target_box)  # Add to pushed boxes
                 self.boxes.remove(self.target_box) # Remove the box after pushing
 
     # === ROAMING: Random motion used during testing ===
@@ -447,15 +484,6 @@ class TidyBotController(Node):
         self.twist.linear.x = 0.0
         self.twist.angular.z = 0.0
         self.velocity_publisher.publish(self.twist)
-
-    # Debug printout for state, box status, and marker positions
-    def log_bot_info(self):
-        box_colors = [b.color for b in self.boxes]
-        pushed_box_colors = [b.color for b in self.pushed_boxes]
-        marker_colors = [s.color for s in self.markers]
-        #self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nPushed: {pushed_box_colors} \nMarkers: {marker_colors}")
-        if self.state == 'PUSHING':
-            self.get_logger().info(f"Moving to {self.move_target} from {self.current_position}")
 
 def main(args=None):
     rclpy.init(args=args)
