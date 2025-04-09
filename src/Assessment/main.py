@@ -48,6 +48,7 @@ class TidyBotController(Node):
         self.pushed_boxes = []
         self.markers = []
         self.lidar_hit_points = []
+        self.lidar_data = []
 
         # HSV ranges for red and green
         self.colors = {
@@ -58,7 +59,7 @@ class TidyBotController(Node):
         # === ROS Subscribers and Publishers ===
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
         self.create_subscription(Image, '/limo/depth_camera_link/depth/image_raw', self.depth_image_callback, 10)
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
         self.create_timer(0.1, self.control_loop)
@@ -67,7 +68,6 @@ class TidyBotController(Node):
         # === Odometry vars ===
         self.current_position = (0.0, 0.0)
         self.current_angle = 0.0
-        self.lidar_data = []
 
     # Callback for updating the robot's position and orientation
     def odometry_callback(self, msg):
@@ -80,9 +80,25 @@ class TidyBotController(Node):
         self.current_angle = euler[2]  # Yaw is rotation around Z
 
     # Callback to update LIDAR data
-    def scan_callback(self, msg):
-        self.lidar_data = msg.ranges
+    def lidar_callback(self, msg):
+        self.lidar_hit_points = []  # Clear previous points
+        self.lidar_data = msg.ranges  # Update lidar_data with the current ranges
 
+        angle_increment = 2 * math.pi / len(msg.ranges)  # Calculate angle increment based on LIDAR data
+        for i, distance in enumerate(msg.ranges):
+            if 0.1 < distance < 10.0:  # Filter out invalid or extreme distances
+                angle = i * angle_increment  # Calculate angle in radians
+                x_local = distance * math.cos(angle)  # LIDAR point in robot's local frame
+                y_local = distance * math.sin(angle)
+
+                # Transform to world coordinates
+                robot_x, robot_y = self.current_position
+                robot_angle = math.radians(self.current_angle)
+                x_world = robot_x + x_local * math.cos(robot_angle) - y_local * math.sin(robot_angle)
+                y_world = robot_y + x_local * math.sin(robot_angle) + y_local * math.cos(robot_angle)
+
+                self.lidar_hit_points.append((x_world, y_world))
+        
     # Depth image callback, detects the depth of boxes and markers using depth camera
     def depth_image_callback(self, data):
         # Show a depth image
@@ -127,7 +143,7 @@ class TidyBotController(Node):
                 # calculate the angle of cy and cx relative to the center of the image
                 camera_angle = math.atan2(cy - image.shape[0] // 2, cx - image.shape[1] // 2)
                 # Calculate the absolute angle in world coordinates
-                offset_angle = camera_angle - math.radians(self.current_angle)
+                offset_angle = camera_angle - self.current_angle
                 # Normalize the angle to be between -pi and pi
                 offset_angle = (offset_angle + math.pi) % (2 * math.pi) - math.pi
                 # Convert to absolute angle in world coordinates
@@ -138,8 +154,11 @@ class TidyBotController(Node):
                 world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
                 pushed = False
-                # Check if the object is pushed against the wall
-
+                # Check if the object is pushed against the wall by comparing to the lidar data, self.lidar_hit_points
+                for i in range(0, len(self.lidar_data), 10):
+                    if self.lidar_data[i] < 0.5:
+                        pushed = True
+                        break
 
                 # Lower half of image = box; upper = marker
                 if cy > image.shape[0] // 2:
@@ -170,28 +189,32 @@ class TidyBotController(Node):
         cv2.namedWindow("Minimap [Debug]", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Minimap [Debug]", 640, 480)
 
-        # Create a blank image to draw the map
-        map_image = np.zeros((480, 640, 3), dtype=np.uint8)
+        # Create a blank light grey image to draw the map
+        map_image = np.zeros((500, 600, 3), dtype=np.uint8)
+        map_image[:] = (200, 200, 200)
+
+        # Draw grid lines
+        for i in range(0, 600, 50):
+            cv2.line(map_image, (i, 0), (i, 500), (150, 150, 150), 1)
+        for i in range(0, 500, 50):
+            cv2.line(map_image, (0, i), (600, i), (150, 150, 150), 1)
 
         # Robot position and orientation
         robot_x_world, robot_y_world = self.current_position
-        robot_yaw = math.radians(self.current_angle)  # Convert angle to radians
+        robot_yaw = np.deg2rad(self.current_angle)  # Convert angle to radians
 
         # Define the center of the minimap in pixels
         minimap_center_x = 300  # Half of the minimap width
         minimap_center_y = 250  # Half of the minimap height
         minimap_scale = 50  # Scale factor for visualization
 
-        # Draw robot position on map
-        map_robot_x = int(robot_x_world * minimap_scale) + minimap_center_x
-        map_robot_y = int(robot_y_world * minimap_scale) + minimap_center_y
-        cv2.circle(map_image, (map_robot_x, map_robot_y), 10, (255, 255, 0), -1)  # Draw robot as a circle
 
-        # Draw robot orientation
-        arrow_length = 1
-        arrow_x = int((robot_x_world + arrow_length * np.cos(robot_yaw)) * minimap_scale) + minimap_center_x
-        arrow_y = int((robot_y_world + arrow_length * np.sin(robot_yaw)) * minimap_scale) + minimap_center_y
-        cv2.arrowedLine(map_image, (map_robot_x, map_robot_y), (arrow_x, arrow_y), (0, 0, 255), 2)
+        # Draw all the stored LIDAR hit points on the map as black dots
+        for point in self.lidar_hit_points:
+            point_x, point_y = point
+            map_point_x = int(point_x * minimap_scale) + minimap_center_x
+            map_point_y = int(point_y * minimap_scale) + minimap_center_y
+            cv2.circle(map_image, (map_point_x, map_point_y), 2, (0, 0, 0), -1)
 
         # Draw all object locations, boxes, markers, and pushed boxes on the map, with colors based on the object color
         for obj in self.boxes + self.markers + self.pushed_boxes:
@@ -212,44 +235,19 @@ class TidyBotController(Node):
             elif obj.obj_type == 'marker':
                 cv2.putText(map_image, 'Marker', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             elif obj.obj_type == 'pushed_box':
-                cv2.putText(map_image, 'Pushed Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)              
+                cv2.putText(map_image, 'Pushed Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)   
 
-        # Store new LIDAR hit points in world coordinates
-        for i in range(len(self.lidar_data)):
-            distance = self.lidar_data[i]
-            if not np.isfinite(distance) or distance <= 0 or distance >= 10:  # Skip invalid or non-positive distances
-                continue
-            angle = math.radians(i)
+        # Draw robot position on map
+        map_robot_x = int(robot_x_world * minimap_scale) + minimap_center_x
+        map_robot_y = int(robot_y_world * minimap_scale) + minimap_center_y
+        cv2.circle(map_image, (map_robot_x, map_robot_y), 10, (255, 255, 0), -1)  # Draw robot as a circle
 
-            # Convert to robot-local coordinates
-            x_local = distance * np.cos(angle)
-            y_local = distance * np.sin(angle)
-
-            # Rotate and translate to world coordinates
-            x_world = x_local * np.cos(robot_yaw) - y_local * np.sin(robot_yaw) + robot_x_world
-            y_world = x_local * np.sin(robot_yaw) + y_local * np.cos(robot_yaw) + robot_y_world
-
-            # Check if the point is too close to another point
-            too_close = False
-            for existing_point in getattr(self, 'lidar_hit_points', []):
-                existing_x, existing_y = existing_point
-                if np.sqrt((x_world - existing_x) ** 2 + (y_world - existing_y) ** 2) < 0.1:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-
-            # Store the point
-            if not hasattr(self, 'lidar_hit_points'):
-                self.lidar_hit_points = []
-            self.lidar_hit_points.append((x_world, y_world))
-
-        # Draw all the stored LIDAR hit points on the map
-        for x_world, y_world in getattr(self, 'lidar_hit_points', []):
-            map_x = int(x_world * minimap_scale) + minimap_center_x
-            map_y = int(y_world * minimap_scale) + minimap_center_y
-            cv2.circle(map_image, (map_x, map_y), 1, (255, 255, 255), -1)  # Draw LIDAR points as small circles
-
+        # Draw robot orientation
+        arrow_length = 1
+        arrow_x = int((robot_x_world + arrow_length * np.cos(robot_yaw)) * minimap_scale) + minimap_center_x
+        arrow_y = int((robot_y_world + arrow_length * np.sin(robot_yaw)) * minimap_scale) + minimap_center_y
+        cv2.arrowedLine(map_image, (map_robot_x, map_robot_y), (arrow_x, arrow_y), (0, 0, 255), 2)
+        
         # Show the map
         cv2.imshow("Minimap [Debug]", map_image)
         cv2.waitKey(1)
@@ -305,7 +303,7 @@ class TidyBotController(Node):
         if self.phase == "In-Progress":
             # Spin in place for scan
             self.twist.linear.x = 0.0
-            self.twist.angular.z = 1.0
+            self.twist.angular.z = 0.0 #1.0
             self.velocity_publisher.publish(self.twist)
 
             if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
@@ -316,8 +314,8 @@ class TidyBotController(Node):
                 self.stop()
                 self.target_box = pair[0]
                 self.target_marker = pair[1]
-                self.state = 'PUSHING'
-                self.phase = 'INIT'
+                #self.state = 'PUSHING'
+                #self.phase = 'INIT'
         elif self.phase == "Finished":
             self.stop()
             self.phase = "None"
