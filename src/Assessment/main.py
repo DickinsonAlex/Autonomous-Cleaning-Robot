@@ -47,6 +47,11 @@ class TidyBotController(Node):
         self.boxes = []
         self.pushed_boxes = []
         self.markers = []
+        self.wall_markers = {
+            'red': None,   # e.g., North
+            'green': None  # e.g., East
+        }
+
         self.lidar_hit_points = []
         self.lidar_data = []
 
@@ -80,7 +85,6 @@ class TidyBotController(Node):
         self.current_angle = euler[2]  # Yaw
 
     def lidar_callback(self, msg):
-        self.lidar_hit_points = []
         self.lidar_data = msg.ranges
 
         for i, distance in enumerate(msg.ranges):
@@ -94,7 +98,16 @@ class TidyBotController(Node):
                 x_world = robot_x + x_local * math.cos(robot_angle) - y_local * math.sin(robot_angle)
                 y_world = robot_y + x_local * math.sin(robot_angle) + y_local * math.cos(robot_angle)
 
-                self.lidar_hit_points.append((x_world, y_world))
+                # Makes sure the point isn't too close to an existing point
+                if not any(math.hypot(x_world - px, y_world - py) < 0.1 for px, py in self.lidar_hit_points):
+                    # Append the point to the list
+                    self.lidar_hit_points.append((x_world, y_world))
+                else:
+                    # If it's too close, update the existing point
+                    for j, (px, py) in enumerate(self.lidar_hit_points):
+                        if math.hypot(x_world - px, y_world - py) < 0.1:
+                            self.lidar_hit_points[j] = (x_world, y_world)
+                            break
         
     # Depth image callback, detects the depth of boxes and markers using depth camera
     def depth_image_callback(self, data):
@@ -122,7 +135,6 @@ class TidyBotController(Node):
         for color, (lower, upper) in self.colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(image, contours, -1, (0, 255, 0), 3)
 
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
@@ -131,7 +143,7 @@ class TidyBotController(Node):
 
                 cx = x + w // 2
                 cy = y + h // 2
-                depth_value = self.depthImage[cy, cx, 0] / 255.0  # meters
+                depth_value = self.depthImage[cy, cx, 0] / 255.0
 
                 pixel_offset = cx - image_center_x
                 angle_offset = (pixel_offset / image.shape[1]) * fov_x
@@ -145,90 +157,97 @@ class TidyBotController(Node):
                 if cy > image.shape[0] // 2:
                     obj_type = 'pushed_box' if pushed else 'box'
                     color_text = (255, 0, 0) if pushed else (0, 255, 0)
-                    label = f"{color} {'pushed box' if pushed else 'box'}"
+                    label = f"{color} {obj_type}"
+                    obj = DetectedObject(obj_type, world_x, world_y, color)
+                    self.update_or_add(obj)
                 else:
-                    obj_type = 'marker'
-                    color_text = (0, 0, 255)
-                    label = f"{color} marker"
-
-                cv2.rectangle(image, (x, y), (x + w, y + h), color_text, 2)
-                cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_text, 2)
-
-                obj = DetectedObject(obj_type, world_x, world_y, color)
-                self.update_or_add(obj)
+                    if self.wall_markers[color] is None:
+                        angle = self.current_angle + angle_offset
+                        self.wall_markers[color] = (world_x, world_y, angle)
+                        marker = DetectedObject('marker', world_x, world_y, color)
+                        self.markers.append(marker)
 
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
 
     # Using known locations, plot the boxes and markers on a minimap
     def minimap_callback(self):
-        # Create a new window to draw a 2D map of the environment
         cv2.namedWindow("Minimap [Debug]", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Minimap [Debug]", 640, 480)
-
-        # Create a blank light grey image to draw the map
         map_image = np.zeros((500, 600, 3), dtype=np.uint8)
         map_image[:] = (200, 200, 200)
 
-        # Draw grid lines
         for i in range(0, 600, 50):
             cv2.line(map_image, (i, 0), (i, 500), (150, 150, 150), 1)
         for i in range(0, 500, 50):
             cv2.line(map_image, (0, i), (600, i), (150, 150, 150), 1)
 
-        # Robot position and orientation
-        robot_x_world, robot_y_world = self.current_position
-        robot_yaw = np.deg2rad(self.current_angle)  # Convert angle to radians
+        minimap_scale = 50
+        center_x = 300
+        center_y = 250
 
-        # Define the center of the minimap in pixels
-        minimap_center_x = 300  # Half of the minimap width
-        minimap_center_y = 250  # Half of the minimap height
-        minimap_scale = 50  # Scale factor for visualization
-
-
-        # Draw all the stored LIDAR hit points on the map as black dots
+        # LIDAR points
         for point in self.lidar_hit_points:
-            point_x, point_y = point
-            map_point_x = int(point_x * minimap_scale) + minimap_center_x
-            map_point_y = int(-point_y * minimap_scale) + minimap_center_y
-            cv2.circle(map_image, (map_point_x, map_point_y), 2, (0, 0, 0), -1)
+            px = int(point[0] * minimap_scale) + center_x
+            py = int(-point[1] * minimap_scale) + center_y
+            cv2.circle(map_image, (px, py), 2, (0, 0, 0), -1)
 
-        # Draw all object locations, boxes, markers, and pushed boxes on the map, with colors based on the object color
-        for obj in self.boxes + self.markers + self.pushed_boxes:
-            obj_x, obj_y = obj.current_position
-            map_obj_x = int(obj_x * minimap_scale) + minimap_center_x
-            map_obj_y = int(-obj_y * minimap_scale) + minimap_center_y
+        # Robot
+        rx = int(self.current_position[0] * minimap_scale) + center_x
+        ry = int(-self.current_position[1] * minimap_scale) + center_y
+        cv2.circle(map_image, (rx, ry), 10, (255, 255, 0), -1)
 
-            # Define a mapping of colors to BGR values for visualization
-            color_mapping = {
-                'red': (0, 0, 255),
-                'green': (0, 255, 0)
-            }
-            color = color_mapping.get(obj.color, (255, 255, 255))  # Default to white if color not found
+        dx = int((self.current_position[0] + math.cos(self.current_angle)) * minimap_scale) + center_x
+        dy = int((-self.current_position[1] - math.sin(self.current_angle)) * minimap_scale) + center_y
+        cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 255), 2)
 
-            cv2.circle(map_image, (map_obj_x, map_obj_y), 5, color, -1)
-            if obj.obj_type == 'box':
-                cv2.putText(map_image, 'Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            elif obj.obj_type == 'marker':
-                cv2.putText(map_image, 'Marker', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            elif obj.obj_type == 'pushed_box':
-                cv2.putText(map_image, 'Pushed Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)   
+        # Boxes / pushed boxes
+        for obj in self.boxes + self.pushed_boxes:
+            ox = int(obj.current_position[0] * minimap_scale) + center_x
+            oy = int(-obj.current_position[1] * minimap_scale) + center_y
+            color = (0, 255, 0) if obj.color == 'green' else (0, 0, 255)
+            label = 'Box' if obj.obj_type == 'box' else 'Pushed Box'
+            cv2.circle(map_image, (ox, oy), 5, color, -1)
+            cv2.putText(map_image, label, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        # Draw robot position on map
-        map_robot_x = int(robot_x_world * minimap_scale) + minimap_center_x
-        map_robot_y = int(-robot_y_world * minimap_scale) + minimap_center_y
-        cv2.circle(map_image, (map_robot_x, map_robot_y), 10, (255, 255, 0), -1)  # Draw robot as a circle
+        # Infer direction based on orientation and annotate accordingly
+        for color, data in self.wall_markers.items():
+            if data:
+                wx_world, wy_world, wall_angle = data
+                wx = int(wx_world * minimap_scale) + center_x
+                wy = int(-wy_world * minimap_scale) + center_y
 
-        # After (flip Y for image coordinates)
-        arrow_length = 1
-        arrow_dx = arrow_length * math.cos(robot_yaw)
-        arrow_dy = arrow_length * math.sin(robot_yaw)
+                # Approximate cardinal direction based on wall_angle
+                angle_deg = (math.degrees(wall_angle) + 360) % 360
+                if 45 <= angle_deg < 135:
+                    direction = "North"
+                elif 135 <= angle_deg < 225:
+                    direction = "West"
+                elif 225 <= angle_deg < 315:
+                    direction = "South"
+                else:
+                    direction = "East"
 
-        arrow_x = int((robot_x_world + arrow_dx) * minimap_scale) + minimap_center_x
-        arrow_y = int((robot_y_world - arrow_dy) * minimap_scale) + minimap_center_y  # ✅ Flip Y
-        cv2.arrowedLine(map_image, (map_robot_x, map_robot_y), (arrow_x, arrow_y), (0, 0, 255), 2)
-        
-        # Show the map
+                wall_color = (0, 255, 0) if color == 'green' else (0, 0, 255)
+                label = f"{direction} {color.capitalize()} Wall"
+
+                        # Draw wall line rotated to match orientation
+                half_len = 30
+                dx = int(half_len * math.cos(wall_angle))
+                dy = int(half_len * math.sin(wall_angle))
+                pt1 = (wx - dx, wy + dy)  # flip Y to match image axis
+                pt2 = (wx + dx, wy - dy)
+                cv2.line(map_image, pt1, pt2, wall_color, 3)
+
+                # Draw directional arrow from center outward
+                arrow_length = 20
+                end_x = int(wx + arrow_length * math.cos(wall_angle))
+                end_y = int(wy - arrow_length * math.sin(wall_angle))
+                cv2.arrowedLine(map_image, (wx, wy), (end_x, end_y), wall_color, 2)
+
+                # Draw label above the wall marker
+                cv2.putText(map_image, label, (wx - 50, wy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, wall_color, 1)
+
         cv2.imshow("Minimap [Debug]", map_image)
         cv2.waitKey(1)
 
