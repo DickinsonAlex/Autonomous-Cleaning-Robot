@@ -107,9 +107,6 @@ class TidyBotController(Node):
         depth_image = cv2.applyColorMap(depth_image, cv2.COLORMAP_JET)  # Apply a color map for better visualization
         
         self.depthImage = depth_image
-        
-        cv2.imshow("Depth Image", depth_image)
-        cv2.waitKey(1)
 
     # Image callback that detects colored boxes and markers using color segmentation and depth image
     def image_callback(self, msg):
@@ -193,14 +190,14 @@ class TidyBotController(Node):
         for point in self.lidar_hit_points:
             point_x, point_y = point
             map_point_x = int(point_x * minimap_scale) + minimap_center_x
-            map_point_y = int(point_y * minimap_scale) + minimap_center_y
+            map_point_y = int(-point_y * minimap_scale) + minimap_center_y
             cv2.circle(map_image, (map_point_x, map_point_y), 2, (0, 0, 0), -1)
 
         # Draw all object locations, boxes, markers, and pushed boxes on the map, with colors based on the object color
         for obj in self.boxes + self.markers + self.pushed_boxes:
             obj_x, obj_y = obj.current_position
             map_obj_x = int(obj_x * minimap_scale) + minimap_center_x
-            map_obj_y = int(obj_y * minimap_scale) + minimap_center_y
+            map_obj_y = int(-obj_y * minimap_scale) + minimap_center_y
 
             # Define a mapping of colors to BGR values for visualization
             color_mapping = {
@@ -219,13 +216,16 @@ class TidyBotController(Node):
 
         # Draw robot position on map
         map_robot_x = int(robot_x_world * minimap_scale) + minimap_center_x
-        map_robot_y = int(robot_y_world * minimap_scale) + minimap_center_y
+        map_robot_y = int(-robot_y_world * minimap_scale) + minimap_center_y
         cv2.circle(map_image, (map_robot_x, map_robot_y), 10, (255, 255, 0), -1)  # Draw robot as a circle
 
-        # Draw robot orientation
+        # After (flip Y for image coordinates)
         arrow_length = 1
-        arrow_x = int((robot_x_world + arrow_length * np.cos(robot_yaw)) * minimap_scale) + minimap_center_x
-        arrow_y = int((robot_y_world + arrow_length * np.sin(robot_yaw)) * minimap_scale) + minimap_center_y
+        arrow_dx = arrow_length * math.cos(robot_yaw)
+        arrow_dy = arrow_length * math.sin(robot_yaw)
+
+        arrow_x = int((robot_x_world + arrow_dx) * minimap_scale) + minimap_center_x
+        arrow_y = int((robot_y_world - arrow_dy) * minimap_scale) + minimap_center_y  # ✅ Flip Y
         cv2.arrowedLine(map_image, (map_robot_x, map_robot_y), (arrow_x, arrow_y), (0, 0, 255), 2)
         
         # Show the map
@@ -305,6 +305,9 @@ class TidyBotController(Node):
             self.stop()
             self.phase = "INIT"  # Reset for next time
             self.state = "ROAMING"
+
+        else:
+            self.phase = "INIT"  # Reset if phase is not recognized
 
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
