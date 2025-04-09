@@ -47,6 +47,13 @@ class TidyBotController(Node):
         self.boxes = []
         self.pushed_boxes = []
         self.markers = []
+        self.lidar_hit_points = []
+
+        # HSV ranges for red and green
+        self.colors = {
+            'red': ([0, 100, 100], [10, 255, 255]),
+            'green': ([50, 100, 100], [70, 255, 255])
+        }
 
         # === ROS Subscribers and Publishers ===
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
@@ -54,7 +61,8 @@ class TidyBotController(Node):
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
-        self.timer = self.create_timer(0.1, self.control_loop)
+        self.create_timer(0.1, self.control_loop)
+        self.create_timer(0.1, self.minimap_callback)
 
         # === Odometry vars ===
         self.current_position = (0.0, 0.0)
@@ -98,13 +106,7 @@ class TidyBotController(Node):
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        # HSV ranges for red and green
-        colors = {
-            'red': ([0, 100, 100], [10, 255, 255]),
-            'green': ([50, 100, 100], [70, 255, 255])
-        }
-
-        for color, (lower, upper) in colors.items():
+        for color, (lower, upper) in self.colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(image, contours, -1, (0, 255, 0), 3)  # Draw contours for debugging
@@ -122,19 +124,22 @@ class TidyBotController(Node):
                 # Use depth image to calculate distance
                 depth_value = self.depthImage[cy, cx, 0] / 255.0  # Convert back to meters
 
-                image_width = image.shape[1] # Width of the image
-                hfov = 90  # Horizontal field of view in degrees
-                angle_offset = ((cx / image_width) - 0.5) * hfov # Calculate angle offset based on pixel position
-                abs_angle = math.radians(self.current_angle) + angle_offset
+                # calculate the angle of cy and cx relative to the center of the image
+                camera_angle = math.atan2(cy - image.shape[0] // 2, cx - image.shape[1] // 2)
+                # Calculate the absolute angle in world coordinates
+                offset_angle = camera_angle - math.radians(self.current_angle)
+                # Normalize the angle to be between -pi and pi
+                offset_angle = (offset_angle + math.pi) % (2 * math.pi) - math.pi
+                # Convert to absolute angle in world coordinates
+                abs_angle = offset_angle + self.current_angle
+                
+                # Calculate world coordinates
                 world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
                 world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
-                # If the depth value is too similar to the lidar depth (against a wall), a box must have been pushed already
                 pushed = False
-                lidar_index = int((angle_offset + 0.5) * len(self.lidar_data))
-                lidar_depth = self.lidar_data[lidar_index] if 0 <= lidar_index < len(self.lidar_data) else float('inf')
-                if abs(depth_value - lidar_depth) < 0.1:
-                    pushed = True
+                # Check if the object is pushed against the wall
+
 
                 # Lower half of image = box; upper = marker
                 if cy > image.shape[0] // 2:
@@ -157,6 +162,96 @@ class TidyBotController(Node):
 
         # Debug visualization
         cv2.imshow("TidyBot View", image)
+        cv2.waitKey(1)
+
+    # Using known locations, plot the boxes and markers on a minimap
+    def minimap_callback(self):
+        # Create a new window to draw a 2D map of the environment
+        cv2.namedWindow("Minimap [Debug]", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Minimap [Debug]", 640, 480)
+
+        # Create a blank image to draw the map
+        map_image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # Robot position and orientation
+        robot_x_world, robot_y_world = self.current_position
+        robot_yaw = math.radians(self.current_angle)  # Convert angle to radians
+
+        # Define the center of the minimap in pixels
+        minimap_center_x = 300  # Half of the minimap width
+        minimap_center_y = 250  # Half of the minimap height
+        minimap_scale = 50  # Scale factor for visualization
+
+        # Draw robot position on map
+        map_robot_x = int(robot_x_world * minimap_scale) + minimap_center_x
+        map_robot_y = int(robot_y_world * minimap_scale) + minimap_center_y
+        cv2.circle(map_image, (map_robot_x, map_robot_y), 10, (255, 255, 0), -1)  # Draw robot as a circle
+
+        # Draw robot orientation
+        arrow_length = 1
+        arrow_x = int((robot_x_world + arrow_length * np.cos(robot_yaw)) * minimap_scale) + minimap_center_x
+        arrow_y = int((robot_y_world + arrow_length * np.sin(robot_yaw)) * minimap_scale) + minimap_center_y
+        cv2.arrowedLine(map_image, (map_robot_x, map_robot_y), (arrow_x, arrow_y), (0, 0, 255), 2)
+
+        # Draw all object locations, boxes, markers, and pushed boxes on the map, with colors based on the object color
+        for obj in self.boxes + self.markers + self.pushed_boxes:
+            obj_x, obj_y = obj.current_position
+            map_obj_x = int(obj_x * minimap_scale) + minimap_center_x
+            map_obj_y = int(obj_y * minimap_scale) + minimap_center_y
+
+            # Define a mapping of colors to BGR values for visualization
+            color_mapping = {
+                'red': (0, 0, 255),
+                'green': (0, 255, 0)
+            }
+            color = color_mapping.get(obj.color, (255, 255, 255))  # Default to white if color not found
+
+            cv2.circle(map_image, (map_obj_x, map_obj_y), 5, color, -1)
+            if obj.obj_type == 'box':
+                cv2.putText(map_image, 'Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            elif obj.obj_type == 'marker':
+                cv2.putText(map_image, 'Marker', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            elif obj.obj_type == 'pushed_box':
+                cv2.putText(map_image, 'Pushed Box', (map_obj_x, map_obj_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)              
+
+        # Store new LIDAR hit points in world coordinates
+        for i in range(len(self.lidar_data)):
+            distance = self.lidar_data[i]
+            if not np.isfinite(distance) or distance <= 0 or distance >= 10:  # Skip invalid or non-positive distances
+                continue
+            angle = math.radians(i)
+
+            # Convert to robot-local coordinates
+            x_local = distance * np.cos(angle)
+            y_local = distance * np.sin(angle)
+
+            # Rotate and translate to world coordinates
+            x_world = x_local * np.cos(robot_yaw) - y_local * np.sin(robot_yaw) + robot_x_world
+            y_world = x_local * np.sin(robot_yaw) + y_local * np.cos(robot_yaw) + robot_y_world
+
+            # Check if the point is too close to another point
+            too_close = False
+            for existing_point in getattr(self, 'lidar_hit_points', []):
+                existing_x, existing_y = existing_point
+                if np.sqrt((x_world - existing_x) ** 2 + (y_world - existing_y) ** 2) < 0.1:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+            # Store the point
+            if not hasattr(self, 'lidar_hit_points'):
+                self.lidar_hit_points = []
+            self.lidar_hit_points.append((x_world, y_world))
+
+        # Draw all the stored LIDAR hit points on the map
+        for x_world, y_world in getattr(self, 'lidar_hit_points', []):
+            map_x = int(x_world * minimap_scale) + minimap_center_x
+            map_y = int(y_world * minimap_scale) + minimap_center_y
+            cv2.circle(map_image, (map_x, map_y), 1, (255, 255, 255), -1)  # Draw LIDAR points as small circles
+
+        # Show the map
+        cv2.imshow("Minimap [Debug]", map_image)
         cv2.waitKey(1)
 
     def update_or_add(self, new_obj):
