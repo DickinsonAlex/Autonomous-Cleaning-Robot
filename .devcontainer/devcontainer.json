@@ -26,10 +26,5 @@
                 "github.vscode-github-actions"
             ]
         }
-    },
-    "hostRequirements": {
-        "gpu": "optional",
-        "cpus": 2,
-        "memory": "3gb"
     }
 }
