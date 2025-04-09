@@ -1,5 +1,3 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/ubuntu
 {
     "name": "L-CAS Humble CUDA-OpenGL Teaching Devcontainer",
     "image": "lcas.lincoln.ac.uk/devcontainer/ros2-teaching:4",
@@ -15,7 +13,7 @@
     "postStartCommand": "/opt/entrypoint.sh /bin/true; .devcontainer/post-create.sh",
 
     "remoteUser": "ros",
-    "updateRemoteUserUID": true, // ensure internal user has the same UID as the host user and update file permissions
+    "updateRemoteUserUID": true,
     "customizations": {
         "vscode": {
             "extensions": [
@@ -32,6 +30,6 @@
     "hostRequirements": {
         "gpu": "optional",
         "cpus": 2,
-        "memory": "8gb"
+        "memory": "3gb"
     }
 }
