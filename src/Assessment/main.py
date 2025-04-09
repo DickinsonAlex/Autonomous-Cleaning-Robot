@@ -29,42 +29,7 @@ class DetectedObject:
         self.current_position = (x, y)
         self.timestamp = timestamp if timestamp else time.time()
 
-# Object tracker that stores seen boxes and markers, manages duplicates and pairing
-class ObjectTracker:
-    def __init__(self):
-        self.boxes = []
-        self.markers = []
-        self.markers_angles = []
-        self.completed_colors = set()
-
-    def update_or_add(self, new_obj):
-        obj_list = self.boxes if new_obj.obj_type == 'box' else self.markers
-
-        for existing in obj_list:
-            if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 1:
-                # If close enough and same color, update
-                existing.update_position(*new_obj.current_position)
-                return
-
-        # Otherwise it's a new object
-        obj_list.append(new_obj)
-        
-    def get_closest_pair(self):
-        best_pair = None
-        best_distance = float('inf')
-        for box in self.boxes:
-            for marker in self.markers:
-                if box.is_same_color(marker) and box.color not in self.completed_colors:
-                    dist = box.distance_to(marker)
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_pair = (box, marker)
-        return best_pair
-
-    def all_boxes_moved(self):
-        active_colors = set(box.color for box in self.boxes)
-        return active_colors.issubset(self.completed_colors)
-
+# Class to track detected objects and their states aswell as the robot's state
 class TidyBotController(Node):
     def __init__(self):
         super().__init__('tidybot_controller')
@@ -73,8 +38,11 @@ class TidyBotController(Node):
         self.bridge = CvBridge()
         self.state = 'SCANNING'
         self.phase = 'INIT'
-        self.tracker = ObjectTracker()
         self.twist = Twist()
+
+        # === Objects ===
+        self.boxes = []
+        self.markers = []
 
         # === ROS Subscribers and Publishers ===
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
@@ -161,19 +129,41 @@ class TidyBotController(Node):
                     obj = DetectedObject('box', world_x, world_y, color)
                     cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     cv2.putText(image, color + ' box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    self.tracker.update_or_add(obj)
+                    self.update_or_add(obj)
                 else:
-                    # There can only be one marker per color
-                    if color not in self.tracker.completed_colors:
-                        obj = DetectedObject('marker', world_x, world_y, color)
-                        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                        cv2.putText(image, color + ' marker', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        self.tracker.update_or_add(obj)
+                    obj = DetectedObject('marker', world_x, world_y, color)
+                    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.putText(image, color + ' marker', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    self.update_or_add(obj)
 
 
         # Debug visualization
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
+
+    def update_or_add(self, new_obj):
+        obj_list = self.boxes if new_obj.obj_type == 'box' else self.markers
+
+        for existing in obj_list:
+            if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 1:
+                # If close enough and same color, update
+                existing.update_position(*new_obj.current_position)
+                return
+
+        # Otherwise it's a new object
+        obj_list.append(new_obj)
+        
+    def get_closest_pair(self):
+        best_pair = None
+        best_distance = float('inf')
+        for box in self.boxes:
+            for marker in self.markers:
+                if box.is_same_color(marker) and box.color not in self.completed_colors:
+                    dist = box.distance_to(marker)
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_pair = (box, marker)
+        return best_pair
 
     # Main control loop dispatches based on state
     def control_loop(self):
@@ -203,7 +193,7 @@ class TidyBotController(Node):
             if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
                 self.phase = "Finished"
 
-            pair = self.tracker.get_closest_pair()
+            pair = self.get_closest_pair()
             if (pair):
                 self.stop()
                 self.target_box = pair[0]
@@ -229,7 +219,6 @@ class TidyBotController(Node):
             norm = np.linalg.norm(direction)
 
             if norm == 0:
-                self.tracker.completed_colors.add(self.target_box.color)
                 self.state = "SCANNING"
                 return
 
@@ -251,7 +240,6 @@ class TidyBotController(Node):
                 self.arrived = self.move_to_target(self.move_target)
             else:
                 self.stop()
-                self.tracker.completed_colors.add(self.target_box.color)
                 self.state = "SCANNING"
                 self.phase = "None"
 
@@ -315,12 +303,12 @@ class TidyBotController(Node):
 
     # Debug printout for state, box status, and marker positions
     def log_bot_info(self):
-        box_colors = [b.color for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
-        marker_colors = [s.color for s in self.tracker.markers]
+        box_colors = [b.color for b in self.boxes]
+        marker_colors = [s.color for s in self.markers]
         self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
         if self.state == 'PUSHING':
             self.get_logger().info(f"Moving to {self.move_target} from {self.current_position}")
-            
+
 def main(args=None):
     rclpy.init(args=args)
     node = TidyBotController()
