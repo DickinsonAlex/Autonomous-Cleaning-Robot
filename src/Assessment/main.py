@@ -74,26 +74,23 @@ class TidyBotController(Node):
         self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         orientation = msg.pose.pose.orientation
 
-        # Get the z axis rotation from the robot's orientation quaternion
+        # Get yaw in radians
         rotation = R.from_quat([orientation.x, orientation.y, orientation.z, orientation.w])
-        euler = rotation.as_euler('xyz', degrees=True)
-        self.current_angle = euler[2]  # Yaw is rotation around Z
+        euler = rotation.as_euler('xyz', degrees=False)  # Now outputs in radians
+        self.current_angle = euler[2]  # Yaw
 
-    # Callback to update LIDAR data
     def lidar_callback(self, msg):
-        self.lidar_hit_points = []  # Clear previous points
-        self.lidar_data = msg.ranges  # Update lidar_data with the current ranges
+        self.lidar_hit_points = []
+        self.lidar_data = msg.ranges
 
-        angle_increment = 2 * math.pi / len(msg.ranges)  # Calculate angle increment based on LIDAR data
         for i, distance in enumerate(msg.ranges):
-            if 0.1 < distance < 10.0:  # Filter out invalid or extreme distances
-                angle = i * angle_increment  # Calculate angle in radians
-                x_local = distance * math.cos(angle)  # LIDAR point in robot's local frame
+            if 0.1 < distance < 10.0:
+                angle = msg.angle_min + i * msg.angle_increment
+                x_local = distance * math.cos(angle)
                 y_local = distance * math.sin(angle)
 
-                # Transform to world coordinates
                 robot_x, robot_y = self.current_position
-                robot_angle = math.radians(self.current_angle)
+                robot_angle = self.current_angle
                 x_world = robot_x + x_local * math.cos(robot_angle) - y_local * math.sin(robot_angle)
                 y_world = robot_y + x_local * math.sin(robot_angle) + y_local * math.cos(robot_angle)
 
@@ -122,64 +119,47 @@ class TidyBotController(Node):
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
+        fov_x = math.radians(90)
+        image_center_x = image.shape[1] / 2
+
         for color, (lower, upper) in self.colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(image, contours, -1, (0, 255, 0), 3)  # Draw contours for debugging
+            cv2.drawContours(image, contours, -1, (0, 255, 0), 3)
 
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
-
-                # Skip detections at edge of frame
                 if x <= 0 or y <= 0 or x + w >= image.shape[1] - 1 or y + h >= image.shape[0] - 1:
                     continue
 
                 cx = x + w // 2
                 cy = y + h // 2
+                depth_value = self.depthImage[cy, cx, 0] / 255.0  # meters
 
-                # Use depth image to calculate distance
-                depth_value = self.depthImage[cy, cx, 0] / 255.0  # Convert back to meters
+                pixel_offset = cx - image_center_x
+                angle_offset = (pixel_offset / image.shape[1]) * fov_x
+                abs_angle = self.current_angle + angle_offset
 
-                # calculate the angle of cy and cx relative to the center of the image
-                camera_angle = math.atan2(cy - image.shape[0] // 2, cx - image.shape[1] // 2)
-                # Calculate the absolute angle in world coordinates
-                offset_angle = camera_angle - self.current_angle
-                # Normalize the angle to be between -pi and pi
-                offset_angle = (offset_angle + math.pi) % (2 * math.pi) - math.pi
-                # Convert to absolute angle in world coordinates
-                abs_angle = offset_angle + self.current_angle
-                
-                # Calculate world coordinates
                 world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
                 world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
-                pushed = False
-                # Check if the object is pushed against the wall by comparing to the lidar data, self.lidar_hit_points
-                for i in range(0, len(self.lidar_data), 10):
-                    if self.lidar_data[i] < 0.5:
-                        pushed = True
-                        break
+                pushed = any(d < 0.5 for d in self.lidar_data[::10])
 
-                # Lower half of image = box; upper = marker
                 if cy > image.shape[0] // 2:
-                    if not pushed:
-                        obj = DetectedObject('box', world_x, world_y, color)
-                        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(image, color + ' box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                        self.update_or_add(obj)
-                    else:
-                        obj = DetectedObject('pushed_box', world_x, world_y, color)
-                        cv2.rectangle(image, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                        cv2.putText(image, color + ' pushed box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                        self.update_or_add(obj)
+                    obj_type = 'pushed_box' if pushed else 'box'
+                    color_text = (255, 0, 0) if pushed else (0, 255, 0)
+                    label = f"{color} {'pushed box' if pushed else 'box'}"
                 else:
-                    obj = DetectedObject('marker', world_x, world_y, color)
-                    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    cv2.putText(image, color + ' marker', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    self.update_or_add(obj)
+                    obj_type = 'marker'
+                    color_text = (0, 0, 255)
+                    label = f"{color} marker"
 
+                cv2.rectangle(image, (x, y), (x + w, y + h), color_text, 2)
+                cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_text, 2)
 
-        # Debug visualization
+                obj = DetectedObject(obj_type, world_x, world_y, color)
+                self.update_or_add(obj)
+
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
 
@@ -300,30 +280,31 @@ class TidyBotController(Node):
 
     # === SCANNING: Rotate in place to detect objects ===
     def handle_scanning(self):
-        if self.phase == "In-Progress":
-            # Spin in place for scan
+        if self.phase == "INIT":
+            self.scan_start_angle = self.current_angle
+            self.phase = "In-Progress"
+
+        elif self.phase == "In-Progress":
             self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.0 #1.0
+            self.twist.angular.z = 0.5
             self.velocity_publisher.publish(self.twist)
 
-            if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
+            angle_turned = (self.current_angle - self.scan_start_angle + 2 * math.pi) % (2 * math.pi)
+            if angle_turned >= math.radians(350):
                 self.phase = "Finished"
 
             pair = self.get_closest_pair()
-            if (pair):
+            if pair:
                 self.stop()
                 self.target_box = pair[0]
                 self.target_marker = pair[1]
-                #self.state = 'PUSHING'
-                #self.phase = 'INIT'
+                self.state = 'PUSHING'
+                self.phase = 'INIT'
+
         elif self.phase == "Finished":
             self.stop()
-            self.phase = "None"
+            self.phase = "INIT"  # Reset for next time
             self.state = "ROAMING"
-        else:
-            # Start scanning
-            self.scan_start_angle = self.current_angle
-            self.phase = "In-Progress"
 
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
@@ -390,7 +371,7 @@ class TidyBotController(Node):
         angle_to_target = math.atan2(delta_y, delta_x)
 
         # Normalize the angle difference
-        angle_diff = (angle_to_target - math.radians(self.current_angle) + math.pi) % (2 * math.pi) - math.pi
+        angle_diff = (angle_to_target - self.current_angle + math.pi) % (2 * math.pi) - math.pi
 
         # Calculate the distance to the target position
         distance_to_target = math.hypot(delta_x, delta_y)
