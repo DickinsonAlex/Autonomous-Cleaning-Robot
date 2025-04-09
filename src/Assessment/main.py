@@ -47,27 +47,7 @@ class ObjectTracker:
 
         # Otherwise it's a new object
         obj_list.append(new_obj)
-
-    def add_marker_angle(self, color, position, angle):
-        # Check if similar measurement exists already
-        if any(s[0] == color and s[1] == position for s in self.markers_angles):
-            return
-
-        # Prevent adding if a marker with that color already confirmed
-        if any(s.color == color for s in self.markers):
-            return
-
-        # Collect three angles for triangulation
-        self.markers_angles.append((color, position, angle))
-
-        if len([s for s in self.markers_angles if s[0] == color]) >= 3:
-            positions = [s[1] for s in self.markers_angles if s[0] == color]
-            avg_x = sum(p[0] for p in positions) / len(positions)
-            avg_y = sum(p[1] for p in positions) / len(positions)
-            new_marker = DetectedObject('marker', avg_x, avg_y, color)
-            self.update_or_add(new_marker)
-            self.markers_angles = [s for s in self.markers_angles if s[0] != color]
-
+        
     def get_closest_pair(self):
         best_pair = None
         best_distance = float('inf')
@@ -91,12 +71,12 @@ class TidyBotController(Node):
         # === INIT: Core States ===
         self.bridge = CvBridge()
         self.state = 'SCANNING'
-        self.push_phase = 'INIT'
+        self.phase = 'INIT'
         self.tracker = ObjectTracker()
         self.twist = Twist()
 
         # === SCAN vars ===
-        self.scan_state = 'None'
+        self.phase = 'None'
         self.scan_stage = 0
         self.scan_points = []
 
@@ -106,10 +86,11 @@ class TidyBotController(Node):
         self.lidar_data = []
 
         # === ROS Subscribers and Publishers ===
-        self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 1)
+        self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
+        self.create_subscription(Image, '/limo/depth_camera_link/depth/image_raw', self.depth_image_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
-        self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
         self.timer = self.create_timer(0.1, self.control_loop)
 
     # Callback for updating the robot's position and orientation
@@ -124,9 +105,24 @@ class TidyBotController(Node):
     def scan_callback(self, msg):
         self.lidar_data = msg.ranges
 
-    # Image callback that detects colored boxes and markers using color segmentation and LIDAR
+    # Depth image callback, detects the depth of boxes and markers using depth camera
+    def depth_image_callback(self, data):
+        # Show a depth image
+        depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
+        depth_image = cv2.resize(depth_image, (640, 480))
+        depth_array = np.array(depth_image, dtype=np.float32)
+        depth_array = np.clip(depth_array, 0, 10)  # Limit depth values to a maximum of 10 meters
+        depth_image = (depth_array * 255 / 10).astype(np.uint8)  # Normalize to 0-255 range
+        depth_image = cv2.applyColorMap(depth_image, cv2.COLORMAP_JET)  # Apply a color map for better visualization
+        
+        self.depthImage = depth_image
+        
+        cv2.imshow("Depth Image", depth_image)
+        cv2.waitKey(1)
+
+    # Image callback that detects colored boxes and markers using color segmentation and depth image
     def image_callback(self, msg):
-        if not self.lidar_data:
+        if not hasattr(self, 'depthImage'):
             return
 
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -138,11 +134,10 @@ class TidyBotController(Node):
             'green': ([50, 100, 100], [70, 255, 255])
         }
 
-        hfov = 90  # Camera horizontal FOV
-
         for color, (lower, upper) in colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(image, contours, -1, (0, 255, 0), 3)  # Draw contours for debugging
 
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
@@ -153,28 +148,30 @@ class TidyBotController(Node):
 
                 cx = x + w // 2
                 cy = y + h // 2
-                angle_offset = ((cx / image.shape[1]) - 0.5) * hfov
 
-                # Map pixel to LIDAR index
-                index = int(len(self.lidar_data) * (angle_offset + hfov / 2) / hfov)
+                # Use depth image to calculate distance
+                depth_value = self.depthImage[cy, cx, 0] / 255.0 * 10.0  # Convert back to meters
+                if depth_value <= 0.1 or depth_value > 10.0:
+                    continue
 
-                if 0 <= index < len(self.lidar_data):
-                    distance = self.lidar_data[index]
+                abs_angle = math.radians(self.current_angle)
+                world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
+                world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
-                    if distance == float('inf') or distance <= 0.1:
-                        continue
-
-                    abs_angle = math.radians(self.current_angle + angle_offset)
-                    world_x = self.current_position[0] + distance * math.cos(abs_angle)
-                    world_y = self.current_position[1] + distance * math.sin(abs_angle)
-
-                    # Lower half of image = box; upper = marker
-                    if cy > image.shape[0] // 2:
-                        obj = DetectedObject('box', world_x, world_y, color)
+                # Lower half of image = box; upper = marker
+                if cy > image.shape[0] // 2:
+                    obj = DetectedObject('box', world_x, world_y, color)
+                    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(image, color + ' box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    self.tracker.update_or_add(obj)
+                else:
+                    # There can only be one marker per color
+                    if color not in self.tracker.completed_colors:
+                        obj = DetectedObject('marker', world_x, world_y, color)
+                        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                        cv2.putText(image, color + ' marker', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                         self.tracker.update_or_add(obj)
-                    else:
-                        if color not in self.tracker.completed_colors:
-                            self.tracker.add_marker_angle(color, self.current_position, abs_angle)
+
 
         # Debug visualization
         cv2.imshow("TidyBot View", image)
@@ -197,47 +194,34 @@ class TidyBotController(Node):
         if handler:
             handler()
 
-    # === SCANNING: Move in triangle and rotate to detect objects ===
+    # === SCANNING: Rotate in place to detect objects ===
     def handle_scanning(self):
-        if self.scan_stage == 0:
-            self.scan_points = [self.current_position]
-            for i in range(3):
-                angle = math.radians(i * 120)
-                x = self.current_position[0] + 0.2 * math.cos(angle)
-                y = self.current_position[1] + 0.2 * math.sin(angle)
-                self.scan_points.append((x, y))
-            self.scan_stage = 1
+        if self.phase != "In-Progress" and self.phase != "Finished":
+            self.scan_start_angle = self.current_angle
+            self.phase = "In-Progress"
 
-        elif self.scan_stage <= 3:
-            if self.move_to_target(self.scan_points[self.scan_stage]):
-                if self.scan_state == "None":
-                    self.scan_start_angle = self.current_angle
-                    self.scan_state = "In-Progress"
+        elif self.phase == "In-Progress":
+            # Spin in place for scan
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 1.0
+            self.velocity_publisher.publish(self.twist)
 
-                elif self.scan_state == "In-Progress":
-                    # Spin in place for scan
-                    self.twist.linear.x = 0.0
-                    self.twist.angular.z = 1.0
-                    self.velocity_publisher.publish(self.twist)
-                    if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
-                        self.scan_state = "Finished"
+            if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
+                self.phase = "Finished"
 
-                if self.scan_state == "Finished":
-                    self.scan_state = "None"
-                    self.scan_stage += 1
-        else:
-            self.scan_stage = 0
-            self.scan_state = "None"
+        if self.phase == "Finished":
+            self.phase = "None"
             self.stop()
             pair = self.tracker.get_closest_pair()
             if pair:
                 self.target_box = pair[0]
                 self.target_marker = pair[1]
                 self.state = 'PUSHING'
+                self.phase = 'INIT'
 
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
-        if self.push_phase == "INIT":
+        if self.phase == "INIT":
             bx, by = self.target_box.current_position
             sx, sy = self.target_marker.current_position
 
@@ -251,27 +235,27 @@ class TidyBotController(Node):
 
             direction = direction / norm
             self.move_target = bx - direction[0] * 0.5, by - direction[1] * 0.5
-            self.push_phase = "MOVE_BEHIND"
+            self.phase = "MOVE_BEHIND"
             self.arrived = False
 
-        elif self.push_phase == "MOVE_BEHIND":
+        elif self.phase == "MOVE_BEHIND":
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
             else:
-                self.push_phase = "PUSH_FORWARD"
+                self.phase = "PUSH_FORWARD"
                 self.move_target = self.target_marker.current_position
                 self.arrived = False
 
-        elif self.push_phase == "PUSH_FORWARD":
+        elif self.phase == "PUSH_FORWARD":
             if not self.arrived:
                 self.arrived = self.move_to_target(self.move_target)
             else:
                 self.stop()
                 self.tracker.completed_colors.add(self.target_box.color)
                 self.state = "SCANNING"
-                self.push_phase = "INIT"
+                self.phase = "None"
 
-        self.get_logger().info(f"Current phase: {self.push_phase}")
+        self.get_logger().info(f"Current phase: {self.phase}")
         self.get_logger().info(f"Moving to {self.move_target}")
         self.get_logger().info(f"Current position: {self.current_position}")
 
@@ -330,7 +314,7 @@ class TidyBotController(Node):
     def log_bot_info(self):
         box_colors = [b.color for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
         marker_colors = [s.color for s in self.tracker.markers]
-        self.get_logger().info(f"\nCurrent State: {self.state} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
+        self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
 
 def main(args=None):
     rclpy.init(args=args)
