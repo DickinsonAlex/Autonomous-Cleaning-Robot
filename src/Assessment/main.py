@@ -29,6 +29,9 @@ class DetectedObject:
         self.current_position = (x, y)
         self.timestamp = timestamp if timestamp else time.time()
 
+    def update_type(self, new_type):
+        self.obj_type = new_type
+
 # Class to track detected objects and their states aswell as the robot's state
 class TidyBotController(Node):
     def __init__(self):
@@ -42,6 +45,7 @@ class TidyBotController(Node):
 
         # === Objects ===
         self.boxes = []
+        self.pushed_boxes = []
         self.markers = []
 
         # === ROS Subscribers and Publishers ===
@@ -116,7 +120,7 @@ class TidyBotController(Node):
                 cy = y + h // 2
 
                 # Use depth image to calculate distance
-                depth_value = self.depthImage[cy, cx, 0] / 255.0 * 10.0  # Convert back to meters
+                depth_value = self.depthImage[cy, cx, 0] / 255.0  # Convert back to meters
                 if depth_value <= 0.1 or depth_value > 10.0:
                     continue
 
@@ -124,12 +128,24 @@ class TidyBotController(Node):
                 world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
                 world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
+                # If the depth value is too similar to the lidar depth (against a wall), a box must have been pushed already
+                pushed = False
+                lidar_depth = self.lidar_data[int((self.current_angle + 360) % 360)] # Find the depth via lidar and angle
+                if abs(depth_value - lidar_depth) < 0.1:
+                    pushed = True
+
                 # Lower half of image = box; upper = marker
                 if cy > image.shape[0] // 2:
-                    obj = DetectedObject('box', world_x, world_y, color)
-                    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(image, color + ' box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    self.update_or_add(obj)
+                    if not pushed:
+                        obj = DetectedObject('box', world_x, world_y, color)
+                        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(image, color + ' box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        self.update_or_add(obj)
+                    else:
+                        obj = DetectedObject('pushed_box', world_x, world_y, color)
+                        cv2.rectangle(image, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                        cv2.putText(image, color + ' pushed box', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                        self.update_or_add(obj)
                 else:
                     obj = DetectedObject('marker', world_x, world_y, color)
                     cv2.rectangle(image, (x, y), (x + w, y + h), (0, 0, 255), 2)
@@ -142,7 +158,12 @@ class TidyBotController(Node):
         cv2.waitKey(1)
 
     def update_or_add(self, new_obj):
-        obj_list = self.boxes if new_obj.obj_type == 'box' else self.markers
+        if new_obj.obj_type == 'box':
+            obj_list = self.boxes 
+        elif new_obj.obj_type == 'pushed_box':
+            obj_list = self.pushed_boxes
+        else:
+            obj_list = self.markers
 
         for existing in obj_list:
             if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 1:
@@ -158,7 +179,7 @@ class TidyBotController(Node):
         best_distance = float('inf')
         for box in self.boxes:
             for marker in self.markers:
-                if box.is_same_color(marker) and box.color not in self.completed_colors:
+                if box.is_same_color(marker):
                     dist = box.distance_to(marker)
                     if dist < best_distance:
                         best_distance = dist
@@ -242,6 +263,7 @@ class TidyBotController(Node):
                 self.stop()
                 self.state = "SCANNING"
                 self.phase = "None"
+                self.boxes.remove(self.target_box) # Remove the box after pushing
 
     # === ROAMING: Random motion used during testing ===
     def handle_roaming(self):
