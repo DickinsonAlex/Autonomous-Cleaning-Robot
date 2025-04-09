@@ -9,6 +9,7 @@ import numpy as np
 import time
 import math
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial import ConvexHull
 
 # Class to represent each detected object (either a box or a marker)
 class DetectedObject:
@@ -170,6 +171,35 @@ class TidyBotController(Node):
         cv2.imshow("TidyBot View", image)
         cv2.waitKey(1)
 
+    def get_outer_square(self, points):
+        if len(points) < 2:
+            return []
+
+        min_x = min(p[0] for p in points)
+        max_x = max(p[0] for p in points)
+        min_y = min(p[1] for p in points)
+        max_y = max(p[1] for p in points)
+
+        # Square side length = max of width or height
+        width = max_x - min_x
+        height = max_y - min_y
+        side = max(width, height)
+
+        # Recenter the square to ensure it's square-shaped
+        cx = (min_x + max_x) / 2
+        cy = (min_y + max_y) / 2
+
+        half = side / 2
+        # Define corners clockwise from top-left
+        return [
+            (cx - half, cy + half),  # Top-left
+            (cx + half, cy + half),  # Top-right
+            (cx + half, cy - half),  # Bottom-right
+            (cx - half, cy - half)   # Bottom-left
+        ]
+
+
+
     # Using known locations, plot the boxes and markers on a minimap
     def minimap_callback(self):
         cv2.namedWindow("Minimap [Debug]", cv2.WINDOW_NORMAL)
@@ -186,11 +216,17 @@ class TidyBotController(Node):
         center_x = 300
         center_y = 250
 
-        # LIDAR points
-        for point in self.lidar_hit_points:
-            px = int(point[0] * minimap_scale) + center_x
-            py = int(-point[1] * minimap_scale) + center_y
-            cv2.circle(map_image, (px, py), 2, (0, 0, 0), -1)
+        # Draw square from outermost points
+        square_corners = self.get_outer_square(self.lidar_hit_points)
+        if len(square_corners) == 4:
+            for i in range(4):
+                pt1 = square_corners[i]
+                pt2 = square_corners[(i + 1) % 4]
+                x1 = int(pt1[0] * minimap_scale) + center_x
+                y1 = int(-pt1[1] * minimap_scale) + center_y
+                x2 = int(pt2[0] * minimap_scale) + center_x
+                y2 = int(-pt2[1] * minimap_scale) + center_y
+                cv2.line(map_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         # Robot
         rx = int(self.current_position[0] * minimap_scale) + center_x
@@ -210,43 +246,34 @@ class TidyBotController(Node):
             cv2.circle(map_image, (ox, oy), 5, color, -1)
             cv2.putText(map_image, label, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        # Infer direction based on orientation and annotate accordingly
-        for color, data in self.wall_markers.items():
-            if data:
-                wx_world, wy_world, wall_angle = data
-                wx = int(wx_world * minimap_scale) + center_x
-                wy = int(-wy_world * minimap_scale) + center_y
-
-                # Approximate cardinal direction based on wall_angle
+        # Draw walls by color on correct square side
+        for color, marker in self.wall_markers.items():
+            if marker:
+                wx, wy, wall_angle = marker
                 angle_deg = (math.degrees(wall_angle) + 360) % 360
+
+                # Determine which wall: N / E / S / W
+                wall_index = None
                 if 45 <= angle_deg < 135:
-                    direction = "North"
+                    wall_index = 0  # Top wall
                 elif 135 <= angle_deg < 225:
-                    direction = "West"
+                    wall_index = 3  # Left wall
                 elif 225 <= angle_deg < 315:
-                    direction = "South"
+                    wall_index = 2  # Bottom wall
                 else:
-                    direction = "East"
+                    wall_index = 1  # Right wall
 
-                wall_color = (0, 255, 0) if color == 'green' else (0, 0, 255)
-                label = f"{direction} {color.capitalize()} Wall"
+                if square_corners:
+                    p1 = square_corners[wall_index]
+                    p2 = square_corners[(wall_index + 1) % 4]
+                    x1 = int(p1[0] * minimap_scale) + center_x
+                    y1 = int(-p1[1] * minimap_scale) + center_y
+                    x2 = int(p2[0] * minimap_scale) + center_x
+                    y2 = int(-p2[1] * minimap_scale) + center_y
 
-                        # Draw wall line rotated to match orientation
-                half_len = 30
-                dx = int(half_len * math.cos(wall_angle))
-                dy = int(half_len * math.sin(wall_angle))
-                pt1 = (wx - dx, wy + dy)  # flip Y to match image axis
-                pt2 = (wx + dx, wy - dy)
-                cv2.line(map_image, pt1, pt2, wall_color, 3)
+                    wall_color = (0, 255, 0) if color == 'green' else (0, 0, 255)
+                    cv2.line(map_image, (x1, y1), (x2, y2), wall_color, 3)
 
-                # Draw directional arrow from center outward
-                arrow_length = 20
-                end_x = int(wx + arrow_length * math.cos(wall_angle))
-                end_y = int(wy - arrow_length * math.sin(wall_angle))
-                cv2.arrowedLine(map_image, (wx, wy), (end_x, end_y), wall_color, 2)
-
-                # Draw label above the wall marker
-                cv2.putText(map_image, label, (wx - 50, wy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, wall_color, 1)
 
         cv2.imshow("Minimap [Debug]", map_image)
         cv2.waitKey(1)
@@ -426,7 +453,7 @@ class TidyBotController(Node):
         box_colors = [b.color for b in self.boxes]
         pushed_box_colors = [b.color for b in self.pushed_boxes]
         marker_colors = [s.color for s in self.markers]
-        self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nPushed: {pushed_box_colors} \nMarkers: {marker_colors}")
+        #self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nPushed: {pushed_box_colors} \nMarkers: {marker_colors}")
         if self.state == 'PUSHING':
             self.get_logger().info(f"Moving to {self.move_target} from {self.current_position}")
 
