@@ -121,16 +121,18 @@ class TidyBotController(Node):
 
                 # Use depth image to calculate distance
                 depth_value = self.depthImage[cy, cx, 0] / 255.0  # Convert back to meters
-                if depth_value <= 0.1 or depth_value > 10.0:
-                    continue
 
-                abs_angle = math.radians(self.current_angle)
+                image_width = image.shape[1] # Width of the image
+                hfov = 90  # Horizontal field of view in degrees
+                angle_offset = ((cx / image_width) - 0.5) * hfov # Calculate angle offset based on pixel position
+                abs_angle = math.radians(self.current_angle) + angle_offset
                 world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
                 world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
 
                 # If the depth value is too similar to the lidar depth (against a wall), a box must have been pushed already
                 pushed = False
-                lidar_depth = self.lidar_data[int((self.current_angle + 360) % 360)] # Find the depth via lidar and angle
+                lidar_index = int((angle_offset + 0.5) * len(self.lidar_data))
+                lidar_depth = self.lidar_data[lidar_index] if 0 <= lidar_index < len(self.lidar_data) else float('inf')
                 if abs(depth_value - lidar_depth) < 0.1:
                     pushed = True
 
@@ -326,8 +328,9 @@ class TidyBotController(Node):
     # Debug printout for state, box status, and marker positions
     def log_bot_info(self):
         box_colors = [b.color for b in self.boxes]
+        pushed_box_colors = [b.color for b in self.pushed_boxes]
         marker_colors = [s.color for s in self.markers]
-        self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
+        self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nPushed: {pushed_box_colors} \nMarkers: {marker_colors}")
         if self.state == 'PUSHING':
             self.get_logger().info(f"Moving to {self.move_target} from {self.current_position}")
 
