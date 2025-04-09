@@ -12,26 +12,21 @@ from scipy.spatial.transform import Rotation as R
 from scipy.spatial import ConvexHull
 
 # Class to represent each detected object (either a box or a marker)
-class DetectedObject:
+class Box:
     def __init__(self, type, x, y, color, timestamp=None):
-        self.obj_type = type  # Either 'box' or 'marker'
-        self.current_position = (x, y)
+        self.position = (x, y)
+        self.obj_type = type
         self.color = color
-        self.timestamp = timestamp if timestamp else time.time()
-
-    def is_same_color(self, other):
-        return self.color == other.color
-
-    def distance_to(self, other):
-        return math.hypot(self.current_position[0] - other.current_position[0],
-                          self.current_position[1] - other.current_position[1])
 
     def update_position(self, x, y, timestamp=None):
-        self.current_position = (x, y)
-        self.timestamp = timestamp if timestamp else time.time()
+        self.position = (x, y)
 
-    def update_type(self, new_type):
-        self.obj_type = new_type
+class Marker:
+    def __init__(self, x, y, color, angle):
+        self.position = (x, y)
+        self.color = color
+        self.wall_direction = None  # To be set later based on the square corners
+        self.angle = angle  # Angle of the marker in the world frame
 
 # Class to track detected objects and their states aswell as the robot's state
 class TidyBotController(Node):
@@ -40,19 +35,16 @@ class TidyBotController(Node):
 
         # === INIT: Core States ===
         self.bridge = CvBridge()
-        self.state = 'SCANNING'
+        self.state = 'SCANNING'  # Initial state
         self.phase = 'INIT'
         self.twist = Twist()
 
         # === Objects ===
         self.boxes = []
-        self.pushed_boxes = []
         self.markers = []
-        self.wall_markers = {
-            'red': None,   # e.g., North
-            'green': None  # e.g., East
-        }
+        self.pushed_boxes = []
 
+        self.square_corners = []  # To store the corners of the outer square
         self.lidar_hit_points = []
         self.lidar_data = []
 
@@ -72,12 +64,12 @@ class TidyBotController(Node):
         self.create_timer(0.1, self.minimap_callback)
 
         # === Odometry vars ===
-        self.current_position = (0.0, 0.0)
+        self.position = (0.0, 0.0)
         self.current_angle = 0.0
 
     # Callback for updating the robot's position and orientation
     def odometry_callback(self, msg):
-        self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+        self.position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         orientation = msg.pose.pose.orientation
 
         # Get yaw in radians
@@ -94,7 +86,7 @@ class TidyBotController(Node):
                 x_local = distance * math.cos(angle)
                 y_local = distance * math.sin(angle)
 
-                robot_x, robot_y = self.current_position
+                robot_x, robot_y = self.position
                 robot_angle = self.current_angle
                 x_world = robot_x + x_local * math.cos(robot_angle) - y_local * math.sin(robot_angle)
                 y_world = robot_y + x_local * math.sin(robot_angle) + y_local * math.cos(robot_angle)
@@ -139,8 +131,12 @@ class TidyBotController(Node):
 
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
-                if x <= 0 or y <= 0 or x + w >= image.shape[1] - 1 or y + h >= image.shape[0] - 1:
-                    continue
+                
+               # Ignore contours that are too small or partially out of frame
+                margin = 5  # Adjust as needed
+                img_h, img_w = image.shape[:2]
+                if x <= margin or y <= margin or x + w >= img_w - margin or y + h >= img_h - margin:
+                    continue  # Skip this contour as it's not fully visible
 
                 cx = x + w // 2
                 cy = y + h // 2
@@ -150,27 +146,20 @@ class TidyBotController(Node):
                 angle_offset = (pixel_offset / image.shape[1]) * fov_x
                 abs_angle = self.current_angle + angle_offset
 
-                world_x = self.current_position[0] + depth_value * math.cos(abs_angle)
-                world_y = self.current_position[1] + depth_value * math.sin(abs_angle)
+                world_x = self.position[0] + depth_value * math.cos(abs_angle)
+                world_y = self.position[1] + depth_value * math.sin(abs_angle)
 
                 pushed = any(d < 0.5 for d in self.lidar_data[::10])
 
                 if cy > image.shape[0] // 2:
                     obj_type = 'pushed_box' if pushed else 'box'
-                    color_text = (255, 0, 0) if pushed else (0, 255, 0)
-                    label = f"{color} {obj_type}"
-                    obj = DetectedObject(obj_type, world_x, world_y, color)
-                    self.update_or_add(obj)
-                else:
-                    if self.wall_markers[color] is None:
-                        angle = self.current_angle + angle_offset
-                        self.wall_markers[color] = (world_x, world_y, angle)
-                        marker = DetectedObject('marker', world_x, world_y, color)
-                        self.markers.append(marker)
+                    obj = Box(obj_type, world_x, world_y, color)
+                    self.update_or_add_box(obj)
+                else:           
+                    obj = Marker(world_x, world_y, color, abs_angle)
+                    self.add_marker(obj)
 
-        cv2.imshow("TidyBot View", image)
-        cv2.waitKey(1)
-
+                    
     def get_outer_square(self, points):
         if len(points) < 2:
             return []
@@ -215,11 +204,11 @@ class TidyBotController(Node):
         center_y = 250
 
         # Draw square from outermost points
-        square_corners = self.get_outer_square(self.lidar_hit_points)
-        if len(square_corners) == 4:
+        self.square_corners = self.get_outer_square(self.lidar_hit_points)
+        if len(self.square_corners) == 4:
             for i in range(4):
-                pt1 = square_corners[i]
-                pt2 = square_corners[(i + 1) % 4]
+                pt1 = self.square_corners[i]
+                pt2 = self.square_corners[(i + 1) % 4]
                 x1 = int(pt1[0] * minimap_scale) + center_x
                 y1 = int(-pt1[1] * minimap_scale) + center_y
                 x2 = int(pt2[0] * minimap_scale) + center_x
@@ -227,18 +216,18 @@ class TidyBotController(Node):
                 cv2.line(map_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         # Robot
-        rx = int(self.current_position[0] * minimap_scale) + center_x
-        ry = int(-self.current_position[1] * minimap_scale) + center_y
+        rx = int(self.position[0] * minimap_scale) + center_x
+        ry = int(-self.position[1] * minimap_scale) + center_y
         cv2.circle(map_image, (rx, ry), 10, (255, 255, 0), -1)
 
-        dx = int((self.current_position[0] + math.cos(self.current_angle)) * minimap_scale) + center_x
-        dy = int((-self.current_position[1] - math.sin(self.current_angle)) * minimap_scale) + center_y
+        dx = int((self.position[0] + math.cos(self.current_angle)) * minimap_scale) + center_x
+        dy = int((-self.position[1] - math.sin(self.current_angle)) * minimap_scale) + center_y
         cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 255), 2)
 
         # Boxes / pushed boxes
         for obj in self.boxes + self.pushed_boxes:
-            ox = int(obj.current_position[0] * minimap_scale) + center_x
-            oy = int(-obj.current_position[1] * minimap_scale) + center_y
+            ox = int(obj.position[0] * minimap_scale) + center_x
+            oy = int(-obj.position[1] * minimap_scale) + center_y
             color = (0, 255, 0) if obj.color == 'green' else (0, 0, 255)
             label = 'Box' if obj.obj_type == 'box' else 'Pushed Box'
             cv2.circle(map_image, (ox, oy), 5, color, -1)
@@ -257,8 +246,8 @@ class TidyBotController(Node):
                 cv2.line(map_image, (rx, ry), (tx, ty), (255, 255, 255), 3)
 
                 if hasattr(self, 'target_box'):
-                    bx = int(self.target_box.current_position[0] * minimap_scale) + center_x
-                    by = int(-self.target_box.current_position[1] * minimap_scale) + center_y
+                    bx = int(self.target_box.position[0] * minimap_scale) + center_x
+                    by = int(-self.target_box.position[1] * minimap_scale) + center_y
                     cv2.circle(map_image, (bx, by), 5, (255, 0, 0), -1)
                     cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
@@ -266,8 +255,8 @@ class TidyBotController(Node):
                     cv2.line(map_image, (tx, ty), (bx, by), (255, 255, 255), 3)
 
                     if hasattr(self, 'target_marker'):
-                        mx = int(self.target_marker.current_position[0] * minimap_scale) + center_x
-                        my = int(-self.target_marker.current_position[1] * minimap_scale) + center_y
+                        mx = int(self.target_marker.position[0] * minimap_scale) + center_x
+                        my = int(-self.target_marker.position[1] * minimap_scale) + center_y
                         cv2.circle(map_image, (mx, my), 5, (255, 255, 0), -1)
                         cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
@@ -278,66 +267,112 @@ class TidyBotController(Node):
         # In the top left, draw the current state
         cv2.putText(map_image, f"State: {self.state}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.putText(map_image, f"Phase: {self.phase}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        cv2.putText(map_image, f"Position: {self.current_position}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Position: {self.position}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.putText(map_image, f"Angle: {math.degrees(self.current_angle):.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         
         # Draw walls by color on correct square side
-        for color, marker in self.wall_markers.items():
-            if marker:
-                wx, wy, wall_angle = marker
-                angle_deg = (math.degrees(wall_angle) + 360) % 360
+        for marker in self.markers:
+            if self.square_corners:
 
-                # Determine which wall: N / E / S / W
-                wall_index = None
-                if 45 <= angle_deg < 135:
-                    wall_index = 0  # Top wall
-                elif 135 <= angle_deg < 225:
-                    wall_index = 3  # Left wall
-                elif 225 <= angle_deg < 315:
-                    wall_index = 2  # Bottom wall
+                wx, wy = marker.position
+                p1, p2 = 0,0
+
+                # Calculate the wall direction using the angle of the marker
+                if marker.angle > math.pi / 4 and marker.angle < 3 * math.pi / 4:
+                    marker.wall_direction = 'North'
+                elif marker.angle > 3 * math.pi / 4 and marker.angle < 5 * math.pi / 4:
+                    marker.wall_direction = 'West'
+                elif marker.angle > 5 * math.pi / 4 and marker.angle < 7 * math.pi / 4:
+                    marker.wall_direction = 'South'
                 else:
-                    wall_index = 1  # Right wall
+                    marker.wall_direction = 'East'
 
-                if square_corners:
-                    p1 = square_corners[wall_index]
-                    p2 = square_corners[(wall_index + 1) % 4]
-                    x1 = int(p1[0] * minimap_scale) + center_x
-                    y1 = int(-p1[1] * minimap_scale) + center_y
-                    x2 = int(p2[0] * minimap_scale) + center_x
-                    y2 = int(-p2[1] * minimap_scale) + center_y
+                # Pair the points by direction (N/E/S/W)
+                if marker.wall_direction == 'North':
+                    p1 = self.square_corners[0]
+                    p2 = self.square_corners[1]
+                elif marker.wall_direction == 'East':
+                    p1 = self.square_corners[1]
+                    p2 = self.square_corners[2]
+                elif marker.wall_direction == 'South':
+                    p1 = self.square_corners[2]
+                    p2 = self.square_corners[3]
+                elif marker.wall_direction == 'West':
+                    p1 = self.square_corners[3]
+                    p2 = self.square_corners[0]
 
-                    wall_color = (0, 255, 0) if color == 'green' else (0, 0, 255)
-                    cv2.line(map_image, (x1, y1), (x2, y2), wall_color, 3)
-                    cv2.putText(map_image, f"{color.capitalize()} Wall", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+                x1 = int(p1[0] * minimap_scale) + center_x
+                y1 = int(-p1[1] * minimap_scale) + center_y
+                x2 = int(p2[0] * minimap_scale) + center_x
+                y2 = int(-p2[1] * minimap_scale) + center_y
+
+                # Update the position of the marker to be the midpoint of the two corners in world position
+                midpoint = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+                print(f"Midpoint: {midpoint}")
+                marker.position = (midpoint[0] , midpoint[1])
+
+                if marker.color == 'red':
+                    wall_color = (0, 0, 255)
+                elif marker.color == 'green':
+                    wall_color = (0, 255, 0)
+                else: wall_color = (255, 255, 0)  # Default color for unknown
+
+                cv2.line(map_image, (x1, y1), (x2, y2), wall_color, 3)
+                cv2.putText(map_image, f"{marker.wall_direction.capitalize()}, {marker.color.capitalize()} Wall", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+            # Draw grey circles at all the different wall marker locations (square_corners)
+            for corner in self.square_corners:
+                wx = int(corner[0] * minimap_scale) + center_x
+                wy = int(-corner[1] * minimap_scale) + center_y
+                cv2.circle(map_image, (wx, wy), 7, (150, 150, 150), -1)
 
 
-        cv2.imshow("Minimap [Debug]", map_image)
+
+
+        cv2.imshow("Debug Screen", map_image)
         cv2.waitKey(1)
 
-    def update_or_add(self, new_obj):
+    def update_or_add_box(self, new_obj):
         if new_obj.obj_type == 'box':
-            obj_list = self.boxes 
+            for existing in self.boxes:
+                # Check if the new object is close enough to an existing one and the same color
+                distance = math.hypot(existing.position[0] - new_obj.position[0],
+                                     existing.position[1] - new_obj.position[1])
+                if existing.color == new_obj.color and distance < 0.2:
+                    existing.update_position(*new_obj.position)
+                    return
+            self.boxes.append(new_obj)  # Otherwise it's a new box
+
         elif new_obj.obj_type == 'pushed_box':
-            obj_list = self.pushed_boxes
-        else:
-            obj_list = self.markers
+            for existing in self.pushed_boxes:
+                # Check if the new object is close enough to an existing one and the same color
+                distance = math.hypot(existing.position[0] - new_obj.position[0],
+                                     existing.position[1] - new_obj.position[1])
+                if existing.color == new_obj.color and distance < 0.2:
+                    existing.update_position(*new_obj.position)
+                    return
+            # If it doesn't exist, add it to the list
+            self.pushed_boxes.append(new_obj)
 
-        for existing in obj_list:
-            if existing.is_same_color(new_obj) and existing.distance_to(new_obj) < 1:
-                # If close enough and same color, update
-                existing.update_position(*new_obj.current_position)
+        return
+    
+    def add_marker(self, new_obj):
+        # There can only be one marker of each color, so check if it exists
+        for existing in self.markers:
+            if existing.color == new_obj.color:
                 return
-
-        # Otherwise it's a new object
-        obj_list.append(new_obj)
+        # If it doesn't exist, add it to the list
+        self.markers.append(new_obj)
         
     def get_closest_pair(self):
         best_pair = None
         best_distance = float('inf')
         for box in self.boxes:
             for marker in self.markers:
-                if box.is_same_color(marker):
-                    dist = box.distance_to(marker)
+                if box.color == marker.color:
+                    dist = math.hypot(box.position[0] - marker.position[0],
+                                     box.position[1] - marker.position[1])
                     if dist < best_distance:
                         best_distance = dist
                         best_pair = (box, marker)
@@ -345,10 +380,6 @@ class TidyBotController(Node):
 
     # Main control loop dispatches based on state
     def control_loop(self):
-        self._loop_count = getattr(self, '_loop_count', 0) + 1
-        if self._loop_count % 20 == 0:
-            self.log_bot_info()  # Log bot info every 2 seconds
-
         # FSM state handler map
         state_handlers = {
             'SCANNING': self.handle_scanning,
@@ -361,27 +392,27 @@ class TidyBotController(Node):
             handler()
 
     # === SCANNING: Rotate in place to detect objects ===
-    def handle_scanning(self):
+    def handle_scanning(self):        
         if self.phase == "INIT":
             self.scan_start_angle = self.current_angle
             self.phase = "In-Progress"
 
         elif self.phase == "In-Progress":
             self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5
+            self.twist.angular.z = 1.0
             self.velocity_publisher.publish(self.twist)
 
             angle_turned = (self.current_angle - self.scan_start_angle + 2 * math.pi) % (2 * math.pi)
             if angle_turned >= math.radians(350):
                 self.phase = "Finished"
 
-            pair = self.get_closest_pair()
-            if pair:
-                self.stop()
-                self.target_box = pair[0]
-                self.target_marker = pair[1]
-                self.state = 'PUSHING'
-                self.phase = 'INIT'
+                pair = self.get_closest_pair()
+                if pair:
+                    self.stop()
+                    self.target_box = pair[0]
+                    self.target_marker = pair[1]
+                    self.state = 'PUSHING'
+                    self.phase = 'INIT'
 
         elif self.phase == "Finished":
             self.stop()
@@ -394,18 +425,28 @@ class TidyBotController(Node):
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
         if self.phase == "INIT":
-            bx, by = self.target_box.current_position
-            sx, sy = self.target_marker.current_position
+            bx, by = self.target_box.position
+            sx, sy = self.target_marker.position
 
-            direction = np.array([sx - bx, sy - by])
-            norm = np.linalg.norm(direction)
+            # Vector from box to marker (push direction)
+            push_vec = np.array([sx - bx, sy - by])
+            norm = np.linalg.norm(push_vec)
 
             if norm == 0:
                 self.state = "SCANNING"
                 return
 
-            direction = direction / norm
-            self.move_target = bx - direction[0] + 0.5, by - direction[1] + 0.5
+            # Normalize the push direction
+            push_dir = push_vec / norm
+
+            # Set a fixed distance to stand behind the box
+            stand_back_distance = 0.5  # meters behind the box
+
+            # Move target is behind the box along the negative push direction
+            move_x = bx - push_dir[0] * stand_back_distance
+            move_y = by - push_dir[1] * stand_back_distance
+
+            self.move_target = (move_x, move_y)
             self.phase = "MOVE_BEHIND"
             self.arrived = False
 
@@ -414,12 +455,11 @@ class TidyBotController(Node):
                 self.arrived = self.move_to_target(self.move_target)
             else:
                 self.phase = "PUSH_FORWARD"
-                self.move_target = self.target_marker.current_position
                 self.arrived = False
 
         elif self.phase == "PUSH_FORWARD":
             if not self.arrived:
-                self.arrived = self.move_to_target(self.move_target)
+                self.arrived = self.move_to_target(self.target_marker.position)
             else:
                 self.stop()
                 self.state = "SCANNING"
@@ -446,10 +486,10 @@ class TidyBotController(Node):
         self.destroy_node()
         rclpy.shutdown()
 
-    # === Helper for moving to target point with rotation logic ===
+    # Function to move the robot towards a target position
     def move_to_target(self, target):
         target_x, target_y = target
-        robot_x, robot_y = self.current_position
+        robot_x, robot_y = self.position
 
         # Calculate the angle to the target position
         delta_x = target_x - robot_x
