@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import time
 import math
+from scipy.spatial.transform import Rotation as R
 
 # Class to represent each detected object (either a box or a marker)
 class DetectedObject:
@@ -75,16 +76,6 @@ class TidyBotController(Node):
         self.tracker = ObjectTracker()
         self.twist = Twist()
 
-        # === SCAN vars ===
-        self.phase = 'None'
-        self.scan_stage = 0
-        self.scan_points = []
-
-        # === Odometry vars ===
-        self.current_position = (0.0, 0.0)
-        self.current_angle = 0.0
-        self.lidar_data = []
-
         # === ROS Subscribers and Publishers ===
         self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
         self.create_subscription(Image, '/limo/depth_camera_link/depth/image_raw', self.depth_image_callback, 10)
@@ -93,13 +84,20 @@ class TidyBotController(Node):
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
         self.timer = self.create_timer(0.1, self.control_loop)
 
+        # === Odometry vars ===
+        self.current_position = (0.0, 0.0)
+        self.current_angle = 0.0
+        self.lidar_data = []
+
     # Callback for updating the robot's position and orientation
     def odometry_callback(self, msg):
         self.current_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        # Estimate current yaw angle in degrees from quaternion
-        self.current_angle = math.degrees(2 * math.atan2(qz, qw))
+        orientation = msg.pose.pose.orientation
+
+        # Get the z axis rotation from the robot's orientation quaternion
+        rotation = R.from_quat([orientation.x, orientation.y, orientation.z, orientation.w])
+        euler = rotation.as_euler('xyz', degrees=True)
+        self.current_angle = euler[2]  # Yaw is rotation around Z
 
     # Callback to update LIDAR data
     def scan_callback(self, msg):
@@ -196,11 +194,7 @@ class TidyBotController(Node):
 
     # === SCANNING: Rotate in place to detect objects ===
     def handle_scanning(self):
-        if self.phase != "In-Progress" and self.phase != "Finished":
-            self.scan_start_angle = self.current_angle
-            self.phase = "In-Progress"
-
-        elif self.phase == "In-Progress":
+        if self.phase == "In-Progress":
             # Spin in place for scan
             self.twist.linear.x = 0.0
             self.twist.angular.z = 1.0
@@ -209,15 +203,21 @@ class TidyBotController(Node):
             if (self.current_angle - self.scan_start_angle + 360) % 360 >= 350:
                 self.phase = "Finished"
 
-        if self.phase == "Finished":
-            self.phase = "None"
-            self.stop()
             pair = self.tracker.get_closest_pair()
-            if pair:
+            if (pair):
+                self.stop()
                 self.target_box = pair[0]
                 self.target_marker = pair[1]
                 self.state = 'PUSHING'
                 self.phase = 'INIT'
+        elif self.phase == "Finished":
+            self.stop()
+            self.phase = "None"
+            self.state = "ROAMING"
+        else:
+            # Start scanning
+            self.scan_start_angle = self.current_angle
+            self.phase = "In-Progress"
 
     # === PUSHING: Move behind box and push to marker ===
     def handle_pushing(self):
@@ -234,7 +234,7 @@ class TidyBotController(Node):
                 return
 
             direction = direction / norm
-            self.move_target = bx - direction[0] * 0.5, by - direction[1] * 0.5
+            self.move_target = bx - direction[0] + 0.5, by - direction[1] + 0.5
             self.phase = "MOVE_BEHIND"
             self.arrived = False
 
@@ -254,10 +254,6 @@ class TidyBotController(Node):
                 self.tracker.completed_colors.add(self.target_box.color)
                 self.state = "SCANNING"
                 self.phase = "None"
-
-        self.get_logger().info(f"Current phase: {self.phase}")
-        self.get_logger().info(f"Moving to {self.move_target}")
-        self.get_logger().info(f"Current position: {self.current_position}")
 
     # === ROAMING: Random motion used during testing ===
     def handle_roaming(self):
@@ -280,21 +276,22 @@ class TidyBotController(Node):
 
     # === Helper for moving to target point with rotation logic ===
     def move_to_target(self, target):
-        tx, ty = target
-        dx = tx - self.current_position[0]
-        dy = ty - self.current_position[1]
+        target_x, target_y = target
+        robot_x, robot_y = self.current_position
 
-        distance = math.hypot(dx, dy)
-        if distance < 0.2:
-            self.stop()
-            return True
+        # Calculate the angle to the target position
+        delta_x = target_x - robot_x
+        delta_y = target_y - robot_y
+        angle_to_target = math.atan2(delta_y, delta_x)
 
-        target_angle = math.degrees(math.atan2(dy, dx)) % 360
-        angle_diff = (target_angle - self.current_angle + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
+        # Normalize the angle difference
+        angle_diff = (angle_to_target - math.radians(self.current_angle) + math.pi) % (2 * math.pi) - math.pi
 
-        if abs(angle_diff) > 5:
+        # Calculate the distance to the target position
+        distance_to_target = math.hypot(delta_x, delta_y)
+
+        # Set the robot's linear and angular velocities
+        if abs(angle_diff) > 0.1:
             self.twist.linear.x = 0.0
             self.twist.angular.z = 0.5 if angle_diff > 0 else -0.5
         else:
@@ -302,6 +299,12 @@ class TidyBotController(Node):
             self.twist.angular.z = 0.0
 
         self.velocity_publisher.publish(self.twist)
+
+        # Check if the robot is close enough to the target position
+        if distance_to_target < 0.2:
+            self.stop()
+            return True
+
         return False
 
     # Stop the robot by zeroing velocity
@@ -315,7 +318,9 @@ class TidyBotController(Node):
         box_colors = [b.color for b in self.tracker.boxes if b.color not in self.tracker.completed_colors]
         marker_colors = [s.color for s in self.tracker.markers]
         self.get_logger().info(f"\nCurrent State: {self.state},{self.phase} \nPosition: {self.current_position} \nAngle: {self.current_angle:.2f} \nBoxes: {box_colors} \nMarkers: {marker_colors}")
-
+        if self.state == 'PUSHING':
+            self.get_logger().info(f"Moving to {self.move_target} from {self.current_position}")
+            
 def main(args=None):
     rclpy.init(args=args)
     node = TidyBotController()
