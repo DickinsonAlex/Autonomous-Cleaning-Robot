@@ -156,13 +156,14 @@ class TidyBotController(Node):
                 robot_x, robot_y = self.position
                 robot_theta = self.current_angle
 
-                # Convert from camera space (assuming forward is z) to robot base frame
-                x_base = x_cam
-                y_base = z_cam  # camera forward becomes robot Y axis
+                # Convert from camera to robot frame (assuming camera faces forward)
+                x_base = z_cam
+                y_base = -x_cam
 
+                # Now transform to world frame
                 world_x = robot_x + x_base * math.cos(robot_theta) - y_base * math.sin(robot_theta)
                 world_y = robot_y + x_base * math.sin(robot_theta) + y_base * math.cos(robot_theta)
-
+                
                 # Determine object type based on vertical position
                 pushed = any(d < 0.5 for d in self.lidar_data[::10])
 
