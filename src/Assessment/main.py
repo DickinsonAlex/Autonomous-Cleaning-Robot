@@ -44,7 +44,7 @@ class TidyBotController(Node):
     def __init__(self):
         super().__init__('tidybot_controller')
 
-        # === INIT: Core States ===
+        # Core states and variables
         self.bridge = CvBridge()
         self.state = 'RETURNING'  # Initial state
         self.phase = 'INIT'
@@ -52,7 +52,7 @@ class TidyBotController(Node):
         self.has_started = False
         self.has_Spun = False
 
-        # === Objects ===
+        # Objects to track
         self.boxes = []
         self.markers = []
         self.pushed_boxes = []
@@ -77,7 +77,7 @@ class TidyBotController(Node):
         self.create_timer(0.1, self.control_loop)
         self.create_timer(0.1, self.minimap_callback)
 
-        # === Odometry vars ===
+        # odometry variables
         self.position = (0.0, 0.0)
         self.current_angle = 0.0
 
@@ -91,6 +91,7 @@ class TidyBotController(Node):
         euler = rotation.as_euler('xyz', degrees=False)  # Now outputs in radians
         self.current_angle = euler[2]  # Yaw
 
+    # Lidar callback to process the laser scan data
     def lidar_callback(self, msg):
         self.lidar_data = msg.ranges
 
@@ -129,7 +130,7 @@ class TidyBotController(Node):
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        # === Camera intrinsic parameters ===
+        # === Camera parameters gathered from node info ===
         fx = 448.625  # from CameraInfo
         fy = 448.625
         cx_intrinsic = 320.5
@@ -199,8 +200,7 @@ class TidyBotController(Node):
                     obj = Marker(world_x, world_y, color, angle)
                     self.add_marker(obj)
 
-
-                    
+    # Function to get the outer square corners from the LiDAR hit points
     def get_outer_square(self, points):
         if len(points) < 2:
             return []
@@ -235,6 +235,7 @@ class TidyBotController(Node):
         map_image = np.zeros((500, 600, 3), dtype=np.uint8)
         map_image[:] = (200, 200, 200)
 
+        # Draw grid lines
         for i in range(0, 600, 50):
             cv2.line(map_image, (i, 0), (i, 500), (150, 150, 150), 1)
         for i in range(0, 500, 50):
@@ -262,7 +263,7 @@ class TidyBotController(Node):
                 y2 = int(-pt2[1] * debug_scale) + center_y
                 cv2.line(map_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-        # Robot
+        # Draw robot position and direction
         rx = int(self.position[0] * debug_scale) + center_x
         ry = int(-self.position[1] * debug_scale) + center_y
         cv2.circle(map_image, (rx, ry), 12, (0, 0, 0), -1)
@@ -272,7 +273,7 @@ class TidyBotController(Node):
         dy = int((-self.position[1] - math.sin(self.current_angle)) * debug_scale) + center_y
         cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 0), 2)
 
-        # Boxes / pushed boxes
+        # Draw the boxes / pushed boxes
         for obj in self.boxes + self.pushed_boxes:
             ox = int(obj.position[0] * debug_scale) + center_x
             oy = int(-obj.position[1] * debug_scale) + center_y
@@ -288,7 +289,7 @@ class TidyBotController(Node):
 
             cv2.circle(map_image, (ox, oy), 5, color, -1)
 
-        # Draw out the Targets
+        # Draw out the movement targets
         if self.state == 'PUSHING':
             if hasattr(self, 'behind_target'):
                 tx, ty = self.behind_target
@@ -373,6 +374,7 @@ class TidyBotController(Node):
         cv2.imshow("Debug Screen", map_image)
         cv2.waitKey(1)
 
+    # Function to update or add a box or pushed box to the list
     def update_or_add_box(self, new_obj):
         if not self.has_started:
             # If the robot is still in startup, don't add boxes yet
@@ -383,7 +385,7 @@ class TidyBotController(Node):
                 # Check if the new object is close enough to an existing one and the same color
                 distance = math.hypot(existing.position[0] - new_obj.position[0],
                                      existing.position[1] - new_obj.position[1])
-                if existing.color == new_obj.color and distance < 0.4:
+                if existing.color == new_obj.color and distance < 0.6:
                     existing.update_position(*new_obj.position)
                     return
             self.boxes.append(new_obj)  # Otherwise it's a new box
@@ -393,7 +395,7 @@ class TidyBotController(Node):
                 # Check if the new object is close enough to an existing one and the same color
                 distance = math.hypot(existing.position[0] - new_obj.position[0],
                                      existing.position[1] - new_obj.position[1])
-                if existing.color == new_obj.color and distance < 0.4:
+                if existing.color == new_obj.color and distance < 0.6:
                     existing.update_position(*new_obj.position)
                     return
             # If it doesn't exist, add it to the list
@@ -401,6 +403,7 @@ class TidyBotController(Node):
 
         return
     
+    # Function to add a marker to the list of markers
     def add_marker(self, new_obj):
         if not self.has_started:
             # If the robot is still in startup, don't add markers yet
@@ -413,6 +416,7 @@ class TidyBotController(Node):
         # If it doesn't exist, add it to the list
         self.markers.append(new_obj)
         
+    # Function to get the closest box and marker pair
     def get_closest_pair(self):
         best_pair = None
         best_distance = float('inf')
@@ -441,7 +445,7 @@ class TidyBotController(Node):
         if handler:
             handler()
 
-    # === SCANNING: Rotate in place to detect objects ===
+    # === SCANNING: Rotate in place to find boxes and markers ===
     def handle_scanning(self):        
         if self.phase == "INIT":
             self.scan_start_angle = self.current_angle
@@ -483,7 +487,7 @@ class TidyBotController(Node):
             sx, sy = self.target_marker.position
 
             # Vector from box to marker (push direction)
-            push_vec = np.array([sx - bx, sy - by])
+            push_vec = np.array([sx - bx*1.1, sy - by*1.1])
             norm = np.linalg.norm(push_vec)
 
             if norm == 0:
@@ -539,11 +543,11 @@ class TidyBotController(Node):
                 self.phase = "INIT"
 
 
-    # === ROAMING: Random motion used during testing ===
+    # === ROAMING: Random motion used to ensure nothing is hidden ===
     def handle_roaming(self):
         # Randomly pick -1 or 1 to turn left or right
         turn_direction = np.random.choice([-3, 3])
-        self.twist.linear.x = 1.0
+        self.twist.linear.x = 1.2
         self.twist.angular.z = float(turn_direction)
         self.velocity_publisher.publish(self.twist)
         time.sleep(0.5)  # Sleep for a bit to simulate random motion
