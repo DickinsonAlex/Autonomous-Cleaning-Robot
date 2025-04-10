@@ -22,3 +22,6 @@
 3. Drag python scripts under **PACKAGENAME** folder
 
 HELP: https://docs.ros.org/en/humble/Tutorials/Beginner-Client-Libraries/Creating-Your-First-ROS2-Package.html
+
+# Other:
+1. Use `ros2 topic echo /limo/depth_camera_link/camera_info` to find the camera info

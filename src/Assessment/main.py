@@ -35,7 +35,7 @@ class TidyBotController(Node):
 
         # === INIT: Core States ===
         self.bridge = CvBridge()
-        self.state = 'SCANNING'  # Initial state
+        self.state = 'RETURNING'  # Initial state
         self.phase = 'INIT'
         self.twist = Twist()
 
@@ -47,6 +47,7 @@ class TidyBotController(Node):
         self.square_corners = []  # To store the corners of the outer square
         self.lidar_hit_points = []
         self.lidar_data = []
+        self.raw_depth_array = []
 
         # HSV ranges for red and green
         self.colors = {
@@ -104,26 +105,22 @@ class TidyBotController(Node):
         
     # Depth image callback, detects the depth of boxes and markers using depth camera
     def depth_image_callback(self, data):
-        # Show a depth image
         depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
-        depth_image = cv2.resize(depth_image, (640, 480))
-        depth_array = np.array(depth_image, dtype=np.float32)
-        depth_array = np.clip(depth_array, 0, 10)  # Limit depth values to a maximum of 10 meters
-        depth_image = (depth_array * 255 / 10).astype(np.uint8)  # Normalize to 0-255 range
-        depth_image = cv2.applyColorMap(depth_image, cv2.COLORMAP_JET)  # Apply a color map for better visualization
-        
-        self.depthImage = depth_image
+        self.raw_depth_array = np.array(depth_image, dtype=np.float32)
 
     # Image callback that detects colored boxes and markers using color segmentation and depth image
     def image_callback(self, msg):
-        if not hasattr(self, 'depthImage'):
+        if not hasattr(self, 'raw_depth_array'):
             return
 
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        fov_x = math.radians(90)
-        image_center_x = image.shape[1] / 2
+        # === Camera intrinsic parameters ===
+        fx = 448.625  # from CameraInfo
+        fy = 448.625
+        cx_intrinsic = 320.5
+        cy_intrinsic = 240.5
 
         for color, (lower, upper) in self.colors.items():
             mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
@@ -131,33 +128,53 @@ class TidyBotController(Node):
 
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
-                
-               # Ignore contours that are too small or partially out of frame
-                margin = 5  # Adjust as needed
+
+                # Ignore contours near the edge
+                margin = 5
                 img_h, img_w = image.shape[:2]
                 if x <= margin or y <= margin or x + w >= img_w - margin or y + h >= img_h - margin:
-                    continue  # Skip this contour as it's not fully visible
+                    continue
 
-                cx = x + w // 2
-                cy = y + h // 2
-                depth_value = self.depthImage[cy, cx, 0] / 255.0
+                # Centroid of contour
+                px = x + w // 2
+                py = y + h // 2
 
-                pixel_offset = cx - image_center_x
-                angle_offset = (pixel_offset / image.shape[1]) * fov_x
-                abs_angle = self.current_angle + angle_offset
+                # Get depth at the centroid
+                if py >= self.raw_depth_array.shape[0] or px >= self.raw_depth_array.shape[1]:
+                    continue
 
-                world_x = self.position[0] + depth_value * math.cos(abs_angle)
-                world_y = self.position[1] + depth_value * math.sin(abs_angle)
+                depth = self.raw_depth_array[py, px]
+                if np.isnan(depth) or depth <= 0.1 or depth > 10.0:
+                    continue
 
+                # === Back-project to 3D camera coordinates ===
+                x_cam = (px - cx_intrinsic) * depth / fx
+                y_cam = (py - cy_intrinsic) * depth / fy
+                z_cam = depth
+
+                # === Transform to world frame ===
+                robot_x, robot_y = self.position
+                robot_theta = self.current_angle
+
+                # Convert from camera space (assuming forward is z) to robot base frame
+                x_base = x_cam
+                y_base = z_cam  # camera forward becomes robot Y axis
+
+                world_x = robot_x + x_base * math.cos(robot_theta) - y_base * math.sin(robot_theta)
+                world_y = robot_y + x_base * math.sin(robot_theta) + y_base * math.cos(robot_theta)
+
+                # Determine object type based on vertical position
                 pushed = any(d < 0.5 for d in self.lidar_data[::10])
 
-                if cy > image.shape[0] // 2:
+                if py > img_h // 2:
                     obj_type = 'pushed_box' if pushed else 'box'
                     obj = Box(obj_type, world_x, world_y, color)
                     self.update_or_add_box(obj)
-                else:           
+                else:
+                    abs_angle = self.current_angle  # no offset needed
                     obj = Marker(world_x, world_y, color, abs_angle)
                     self.add_marker(obj)
+
 
                     
     def get_outer_square(self, points):
@@ -218,20 +235,28 @@ class TidyBotController(Node):
         # Robot
         rx = int(self.position[0] * minimap_scale) + center_x
         ry = int(-self.position[1] * minimap_scale) + center_y
-        cv2.circle(map_image, (rx, ry), 10, (255, 255, 0), -1)
+        cv2.circle(map_image, (rx, ry), 12, (0, 0, 0), -1)
+        cv2.circle(map_image, (rx, ry), 10, (255, 255, 255), -1)
 
         dx = int((self.position[0] + math.cos(self.current_angle)) * minimap_scale) + center_x
         dy = int((-self.position[1] - math.sin(self.current_angle)) * minimap_scale) + center_y
-        cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 255), 2)
+        cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 0), 2)
 
         # Boxes / pushed boxes
         for obj in self.boxes + self.pushed_boxes:
             ox = int(obj.position[0] * minimap_scale) + center_x
             oy = int(-obj.position[1] * minimap_scale) + center_y
-            color = (0, 255, 0) if obj.color == 'green' else (0, 0, 255)
-            label = 'Box' if obj.obj_type == 'box' else 'Pushed Box'
+            
+            if obj.color == 'red':
+                color = (0, 0, 255)
+            elif obj.color == 'green':
+                color = (0, 255, 0)
+
+            #If pushed, darken the color
+            if obj.obj_type == 'pushed_box':
+                color = tuple(int(c * 0.5) for c in color)
+
             cv2.circle(map_image, (ox, oy), 5, color, -1)
-            cv2.putText(map_image, label, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
         # Draw out the Targets
         if self.state == 'PUSHING':
@@ -239,29 +264,30 @@ class TidyBotController(Node):
                 tx, ty = self.move_target
                 tx = int(tx * minimap_scale) + center_x
                 ty = int(-ty * minimap_scale) + center_y
-                cv2.circle(map_image, (tx, ty), 5, (255, 0, 255), -1)
-                cv2.putText(map_image, '1', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                cv2.circle(map_image, (tx, ty), 10, (255, 255, 255), -1)
+                cv2.circle(map_image, (tx, ty), 8, (255, 0, 0), -1)
+                cv2.putText(map_image, '1', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
-                # Draw line between robot and move target
-                cv2.line(map_image, (rx, ry), (tx, ty), (255, 255, 255), 3)
+            if hasattr(self, 'target_box'):
+                bx = int(self.target_box.position[0] * minimap_scale) + center_x
+                by = int(-self.target_box.position[1] * minimap_scale) + center_y
+                cv2.circle(map_image, (bx, by), 10, (255, 255, 255), -1)
+                cv2.circle(map_image, (bx, by), 8, (255, 0, 0), -1)
+                cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
-                if hasattr(self, 'target_box'):
-                    bx = int(self.target_box.position[0] * minimap_scale) + center_x
-                    by = int(-self.target_box.position[1] * minimap_scale) + center_y
-                    cv2.circle(map_image, (bx, by), 5, (255, 0, 0), -1)
-                    cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            if hasattr(self, 'target_marker'):
+                mx = int(self.target_marker.position[0] * minimap_scale) + center_x
+                my = int(-self.target_marker.position[1] * minimap_scale) + center_y
+                cv2.circle(map_image, (mx, my), 10, (255, 255, 255), -1)
+                cv2.circle(map_image, (mx, my), 8, (255, 0, 0), -1)
+                cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
-                    # Draw line between move target and box
-                    cv2.line(map_image, (tx, ty), (bx, by), (255, 255, 255), 3)
-
-                    if hasattr(self, 'target_marker'):
-                        mx = int(self.target_marker.position[0] * minimap_scale) + center_x
-                        my = int(-self.target_marker.position[1] * minimap_scale) + center_y
-                        cv2.circle(map_image, (mx, my), 5, (255, 255, 0), -1)
-                        cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-
-                        # Draw line between box and marker
-                        cv2.line(map_image, (bx, by), (mx, my), (255, 255, 255), 3)
+            if self.phase == 'MOVE_BEHIND':
+                # Draw a line from the bot to the move_target
+                cv2.line(map_image, (rx, ry), (tx, ty), (255, 0, 255), 2)
+            elif self.phase == 'PUSH_FORWARD':
+                # Draw a line from the bot to the target_marker
+                cv2.line(map_image, (rx, ry), (mx, my), (255, 255, 0), 2)
 
 
         # In the top left, draw the current state
@@ -269,6 +295,11 @@ class TidyBotController(Node):
         cv2.putText(map_image, f"Phase: {self.phase}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.putText(map_image, f"Position: {self.position}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.putText(map_image, f"Angle: {math.degrees(self.current_angle):.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+        # If pushing, draw the target box and marker
+        if self.state == 'PUSHING':
+            cv2.putText(map_image, f"Target Box: {self.target_box.color} : {self.target_box.position}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.putText(map_image, f"Target Marker: {self.target_marker.color} : {self.target_marker.position}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         
         # Draw walls by color on correct square side
         for marker in self.markers:
@@ -309,7 +340,6 @@ class TidyBotController(Node):
 
                 # Update the position of the marker to be the midpoint of the two corners in world position
                 midpoint = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
-                print(f"Midpoint: {midpoint}")
                 marker.position = (midpoint[0] , midpoint[1])
 
                 if marker.color == 'red':
@@ -319,16 +349,13 @@ class TidyBotController(Node):
                 else: wall_color = (255, 255, 0)  # Default color for unknown
 
                 cv2.line(map_image, (x1, y1), (x2, y2), wall_color, 3)
-                cv2.putText(map_image, f"{marker.wall_direction.capitalize()}, {marker.color.capitalize()} Wall", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                #cv2.putText(map_image, f"{marker.wall_direction.capitalize()}, {marker.color.capitalize()} Wall", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
             # Draw grey circles at all the different wall marker locations (square_corners)
             for corner in self.square_corners:
                 wx = int(corner[0] * minimap_scale) + center_x
                 wy = int(-corner[1] * minimap_scale) + center_y
                 cv2.circle(map_image, (wx, wy), 7, (150, 150, 150), -1)
-
-
-
 
         cv2.imshow("Debug Screen", map_image)
         cv2.waitKey(1)
@@ -385,6 +412,7 @@ class TidyBotController(Node):
             'SCANNING': self.handle_scanning,
             'PUSHING': self.handle_pushing,
             'ROAMING': self.handle_roaming,
+            'RETURNING': self.handle_returning,
             'FINISHED': self.handle_finished
         }
         handler = state_handlers.get(self.state)
@@ -462,10 +490,26 @@ class TidyBotController(Node):
                 self.arrived = self.move_to_target(self.target_marker.position)
             else:
                 self.stop()
-                self.state = "SCANNING"
-                self.phase = "None"
+                self.state = "RETURNING"
+                self.phase = "INIT"
                 self.pushed_boxes.append(self.target_box)  # Add to pushed boxes
                 self.boxes.remove(self.target_box) # Remove the box after pushing
+
+    # === RETURNING: Move back to the starting position at 0,0 ===
+    def handle_returning(self):
+        if self.phase == "INIT":
+            self.move_target = (0.0, 0.0)
+            self.phase = "MOVE_BACK"
+            self.arrived = False
+
+        elif self.phase == "MOVE_BACK":
+            if not self.arrived:
+                self.arrived = self.move_to_target(self.move_target)
+            else:
+                self.stop()
+                self.state = "SCANNING"
+                self.phase = "INIT"
+
 
     # === ROAMING: Random motion used during testing ===
     def handle_roaming(self):
@@ -513,7 +557,7 @@ class TidyBotController(Node):
         self.velocity_publisher.publish(self.twist)
 
         # Check if the robot is close enough to the target position
-        if distance_to_target < 0.2:
+        if distance_to_target < 0.4:
             self.stop()
             return True
 
