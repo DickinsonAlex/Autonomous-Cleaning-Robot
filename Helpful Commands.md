@@ -25,3 +25,5 @@ HELP: https://docs.ros.org/en/humble/Tutorials/Beginner-Client-Libraries/Creatin
 
 # Other:
 1. Use `ros2 topic echo /limo/depth_camera_link/camera_info` to find the camera info
+1. `zenoh-bridge-ros2dds -e tcp/10.82.0.XXX:7447`
+104 instead of XXX (bot ID)

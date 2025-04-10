@@ -69,8 +69,8 @@ class TidyBotController(Node):
         }
 
         # === ROS Subscribers and Publishers ===
-        self.create_subscription(Image, '/limo/depth_camera_link/image_raw', self.image_callback, 10)
-        self.create_subscription(Image, '/limo/depth_camera_link/depth/image_raw', self.depth_image_callback, 10)
+        self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 10)
+        self.create_subscription(Image, '/camera/depth/image_raw', self.depth_image_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
         self.velocity_publisher = self.create_publisher(Twist, 'cmd_vel', 1)
