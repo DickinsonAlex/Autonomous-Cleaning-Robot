@@ -141,7 +141,7 @@ class TidyBotController(Node):
                 py = y + h // 2
 
                 # Get depth at the centroid
-                if not hasattr(self, 'raw_depth_array') or self.raw_depth_array is None or self.raw_depth_array.size == 0:
+                if not hasattr(self, 'raw_depth_array') or self.raw_depth_array is None or len(self.raw_depth_array) == 0:
                     continue
 
                 if py >= self.raw_depth_array.shape[0] or px >= self.raw_depth_array.shape[1]:
@@ -506,18 +506,6 @@ class TidyBotController(Node):
             move_x = bx - push_dir[0] * stand_back_distance
             move_y = by - push_dir[1] * stand_back_distance
 
-            # Pick randomly -90 or 90 to turn left or right
-            turn_direction = np.random.choice([-90, 90])
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = float(turn_direction)
-            self.velocity_publisher.publish(self.twist)
-            time.sleep(1)  # Sleep for a bit to simulate random motion, this prevents the robot from consistently running straight on into the box before getting behind it
-            
-            self.twist.linear.x = 3.0
-            self.twist.angular.z = 0.0
-            self.velocity_publisher.publish(self.twist)
-            time.sleep(1) # Sleep for a bit to simulate random motion, this prevents the robot from consistently running straight on into the box before getting behind it
-
             self.behind_target = (move_x, move_y)
             self.phase = "BEHIND_TARGET_BOX"
             self.arrived = False
@@ -590,31 +578,9 @@ class TidyBotController(Node):
         # Calculate the distance to the target position
         distance_to_target = math.hypot(delta_x, delta_y)
 
-        # Check for obstacles in the path using LiDAR
-        obstacle_detected = False
-        for i, distance in enumerate(self.lidar_data):
-            if 0.1 < distance < 0.5:  # Adjust threshold as needed
-                angle = self.current_angle
-                obstacle_x = robot_x + distance * math.cos(angle)
-                obstacle_y = robot_y + distance * math.sin(angle)
-
-                # Check if the obstacle is in the direct path to the target
-                if abs(math.atan2(obstacle_y - robot_y, obstacle_x - robot_x) - angle_to_target) < math.radians(15):
-                    obstacle_detected = True
-                    break
-
-
-        # Adjust velocities based on obstacle detection
-        if obstacle_detected:
-            # Rotate slightly to avoid the obstacle
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5  # Rotate to the right
-        else:
-            # Move towards the target
-            self.twist.linear.x = 1.0
-            self.twist.angular.z = angle_diff * 2.0  # Proportional control for rotation
-
-        self.twist.angular.z = angle_diff * 2.0  # Proportional control for rotation
+        # Set linear and angular velocities
+        self.twist.linear.x = 1.0  # Move forward
+        self.twist.angular.z = angle_diff # Turn towards the target
         self.velocity_publisher.publish(self.twist)
 
         # Check if the robot is close enough to the target position
