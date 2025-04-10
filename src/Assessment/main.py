@@ -38,6 +38,7 @@ class TidyBotController(Node):
         self.state = 'RETURNING'  # Initial state
         self.phase = 'INIT'
         self.twist = Twist()
+        self.has_started = False
 
         # === Objects ===
         self.boxes = []
@@ -164,11 +165,23 @@ class TidyBotController(Node):
                 world_x = robot_x + x_base * math.cos(robot_theta) - y_base * math.sin(robot_theta)
                 world_y = robot_y + x_base * math.sin(robot_theta) + y_base * math.cos(robot_theta)
                 
-                # Determine object type based on vertical position
-                pushed = any(d < 0.5 for d in self.lidar_data[::10])
+                # Check if the object is against a colored wall
+                against_wall = False
+                for marker in self.markers:
+                    if marker.color == color:
+                        if marker.wall_direction in ['North', 'South']:
+                            # Compare y-coordinates for North/South walls
+                            if abs(world_y - marker.position[1]) < 0.2:
+                                against_wall = True
+                                break
+                        elif marker.wall_direction in ['East', 'West']:
+                            # Compare x-coordinates for East/West walls
+                            if abs(world_x - marker.position[0]) < 0.2:
+                                against_wall = True
+                                break
 
                 if py > img_h // 2:
-                    obj_type = 'pushed_box' if pushed else 'box'
+                    obj_type = 'pushed_box' if against_wall else 'box'
                     obj = Box(obj_type, world_x, world_y, color)
                     self.update_or_add_box(obj)
                 else:
@@ -217,7 +230,7 @@ class TidyBotController(Node):
         for i in range(0, 500, 50):
             cv2.line(map_image, (0, i), (600, i), (150, 150, 150), 1)
 
-        minimap_scale = 50
+        debug_scale = 50
         center_x = 300
         center_y = 250
 
@@ -227,26 +240,26 @@ class TidyBotController(Node):
             for i in range(4):
                 pt1 = self.square_corners[i]
                 pt2 = self.square_corners[(i + 1) % 4]
-                x1 = int(pt1[0] * minimap_scale) + center_x
-                y1 = int(-pt1[1] * minimap_scale) + center_y
-                x2 = int(pt2[0] * minimap_scale) + center_x
-                y2 = int(-pt2[1] * minimap_scale) + center_y
+                x1 = int(pt1[0] * debug_scale) + center_x
+                y1 = int(-pt1[1] * debug_scale) + center_y
+                x2 = int(pt2[0] * debug_scale) + center_x
+                y2 = int(-pt2[1] * debug_scale) + center_y
                 cv2.line(map_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         # Robot
-        rx = int(self.position[0] * minimap_scale) + center_x
-        ry = int(-self.position[1] * minimap_scale) + center_y
+        rx = int(self.position[0] * debug_scale) + center_x
+        ry = int(-self.position[1] * debug_scale) + center_y
         cv2.circle(map_image, (rx, ry), 12, (0, 0, 0), -1)
         cv2.circle(map_image, (rx, ry), 10, (255, 255, 255), -1)
 
-        dx = int((self.position[0] + math.cos(self.current_angle)) * minimap_scale) + center_x
-        dy = int((-self.position[1] - math.sin(self.current_angle)) * minimap_scale) + center_y
+        dx = int((self.position[0] + math.cos(self.current_angle)) * debug_scale) + center_x
+        dy = int((-self.position[1] - math.sin(self.current_angle)) * debug_scale) + center_y
         cv2.arrowedLine(map_image, (rx, ry), (dx, dy), (0, 0, 0), 2)
 
         # Boxes / pushed boxes
         for obj in self.boxes + self.pushed_boxes:
-            ox = int(obj.position[0] * minimap_scale) + center_x
-            oy = int(-obj.position[1] * minimap_scale) + center_y
+            ox = int(obj.position[0] * debug_scale) + center_x
+            oy = int(-obj.position[1] * debug_scale) + center_y
             
             if obj.color == 'red':
                 color = (0, 0, 255)
@@ -261,29 +274,29 @@ class TidyBotController(Node):
 
         # Draw out the Targets
         if self.state == 'PUSHING':
-            if hasattr(self, 'move_target'):
-                tx, ty = self.move_target
-                tx = int(tx * minimap_scale) + center_x
-                ty = int(-ty * minimap_scale) + center_y
+            if hasattr(self, 'behind_target'):
+                tx, ty = self.behind_target
+                tx = int(tx * debug_scale) + center_x
+                ty = int(-ty * debug_scale) + center_y
                 cv2.circle(map_image, (tx, ty), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (tx, ty), 8, (255, 0, 0), -1)
                 cv2.putText(map_image, '1', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
             if hasattr(self, 'target_box'):
-                bx = int(self.target_box.position[0] * minimap_scale) + center_x
-                by = int(-self.target_box.position[1] * minimap_scale) + center_y
+                bx = int(self.target_box.position[0] * debug_scale) + center_x
+                by = int(-self.target_box.position[1] * debug_scale) + center_y
                 cv2.circle(map_image, (bx, by), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (bx, by), 8, (255, 0, 0), -1)
                 cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
             if hasattr(self, 'target_marker'):
-                mx = int(self.target_marker.position[0] * minimap_scale) + center_x
-                my = int(-self.target_marker.position[1] * minimap_scale) + center_y
+                mx = int(self.target_marker.position[0] * debug_scale) + center_x
+                my = int(-self.target_marker.position[1] * debug_scale) + center_y
                 cv2.circle(map_image, (mx, my), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (mx, my), 8, (255, 0, 0), -1)
                 cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
 
-            if self.phase == 'MOVE_BEHIND':
+            if self.phase == 'BEHIND_TARGET_BOX':
                 # Draw a line from the bot to the move_target
                 cv2.line(map_image, (rx, ry), (tx, ty), (255, 0, 255), 2)
             elif self.phase == 'PUSH_FORWARD':
@@ -334,10 +347,10 @@ class TidyBotController(Node):
                     p2 = self.square_corners[0]
 
 
-                x1 = int(p1[0] * minimap_scale) + center_x
-                y1 = int(-p1[1] * minimap_scale) + center_y
-                x2 = int(p2[0] * minimap_scale) + center_x
-                y2 = int(-p2[1] * minimap_scale) + center_y
+                x1 = int(p1[0] * debug_scale) + center_x
+                y1 = int(-p1[1] * debug_scale) + center_y
+                x2 = int(p2[0] * debug_scale) + center_x
+                y2 = int(-p2[1] * debug_scale) + center_y
 
                 # Update the position of the marker to be the midpoint of the two corners in world position
                 midpoint = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
@@ -354,14 +367,18 @@ class TidyBotController(Node):
 
             # Draw grey circles at all the different wall marker locations (square_corners)
             for corner in self.square_corners:
-                wx = int(corner[0] * minimap_scale) + center_x
-                wy = int(-corner[1] * minimap_scale) + center_y
+                wx = int(corner[0] * debug_scale) + center_x
+                wy = int(-corner[1] * debug_scale) + center_y
                 cv2.circle(map_image, (wx, wy), 7, (150, 150, 150), -1)
 
         cv2.imshow("Debug Screen", map_image)
         cv2.waitKey(1)
 
     def update_or_add_box(self, new_obj):
+        if not self.has_started:
+            # If the robot is still in startup, don't add boxes yet
+            return
+
         if new_obj.obj_type == 'box':
             for existing in self.boxes:
                 # Check if the new object is close enough to an existing one and the same color
@@ -386,6 +403,10 @@ class TidyBotController(Node):
         return
     
     def add_marker(self, new_obj):
+        if not self.has_started:
+            # If the robot is still in startup, don't add markers yet
+            return
+        
         # There can only be one marker of each color, so check if it exists
         for existing in self.markers:
             if existing.color == new_obj.color:
@@ -410,6 +431,7 @@ class TidyBotController(Node):
     def control_loop(self):
         # FSM state handler map
         state_handlers = {
+            'STARTUP': self.handle_scanning,  # Start scanning, but don't detect markers (Needs to figure out bounds first)
             'SCANNING': self.handle_scanning,
             'PUSHING': self.handle_pushing,
             'ROAMING': self.handle_roaming,
@@ -426,28 +448,28 @@ class TidyBotController(Node):
             self.scan_start_angle = self.current_angle
             self.phase = "In-Progress"
 
-        elif self.phase == "In-Progress":
+        elif self.phase == "In-Progress" or self.state == "STARTUP":
             self.twist.linear.x = 0.0
             self.twist.angular.z = 1.0
             self.velocity_publisher.publish(self.twist)
 
             angle_turned = (self.current_angle - self.scan_start_angle + 2 * math.pi) % (2 * math.pi)
             if angle_turned >= math.radians(350):
-                self.phase = "Finished"
+                self.phase = "INIT"  # Reset for next time
+
+                if self.state == "STARTUP":
+                    self.state = "SCANNING"  # Start scanning for boxes and markers
+                    self.has_started = True
+                else:
+                    self.stop()
+                    self.state = "ROAMING" # Start roaming to find boxes
 
                 pair = self.get_closest_pair()
                 if pair:
                     self.stop()
                     self.target_box = pair[0]
                     self.target_marker = pair[1]
-                    self.state = 'PUSHING'
-                    self.phase = 'INIT'
-
-        elif self.phase == "Finished":
-            self.stop()
-            self.phase = "INIT"  # Reset for next time
-            self.state = "ROAMING"
-
+                    self.state = 'PUSHING' # Start pushing the box
         else:
             self.phase = "INIT"  # Reset if phase is not recognized
 
@@ -475,13 +497,25 @@ class TidyBotController(Node):
             move_x = bx - push_dir[0] * stand_back_distance
             move_y = by - push_dir[1] * stand_back_distance
 
-            self.move_target = (move_x, move_y)
-            self.phase = "MOVE_BEHIND"
+            # Pick randomly -90 or 90 to turn left or right
+            turn_direction = np.random.choice([-90, 90])
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = float(turn_direction)
+            self.velocity_publisher.publish(self.twist)
+            time.sleep(1)  # Sleep for a bit to simulate random motion, this prevents the robot from consistently running straight on into the box before getting behind it
+            
+            self.twist.linear.x = 3.0
+            self.twist.angular.z = 0.0
+            self.velocity_publisher.publish(self.twist)
+            time.sleep(1) # Sleep for a bit to simulate random motion, this prevents the robot from consistently running straight on into the box before getting behind it
+
+            self.behind_target = (move_x, move_y)
+            self.phase = "BEHIND_TARGET_BOX"
             self.arrived = False
 
-        elif self.phase == "MOVE_BEHIND":
+        elif self.phase == "BEHIND_TARGET_BOX":
             if not self.arrived:
-                self.arrived = self.move_to_target(self.move_target)
+                self.arrived = self.move_to_target(self.behind_target)
             else:
                 self.phase = "PUSH_FORWARD"
                 self.arrived = False
@@ -493,35 +527,35 @@ class TidyBotController(Node):
                 self.stop()
                 self.state = "RETURNING"
                 self.phase = "INIT"
-                self.pushed_boxes.append(self.target_box)  # Add to pushed boxes
                 self.boxes.remove(self.target_box) # Remove the box after pushing
 
     # === RETURNING: Move back to the starting position at 0,0 ===
     def handle_returning(self):
         if self.phase == "INIT":
-            self.move_target = (0.0, 0.0)
+            self.behind_target = (0.0, 0.0)
             self.phase = "MOVE_BACK"
             self.arrived = False
 
         elif self.phase == "MOVE_BACK":
             if not self.arrived:
-                self.arrived = self.move_to_target(self.move_target)
+                self.arrived = self.move_to_target(self.behind_target)
             else:
                 self.stop()
-                self.state = "SCANNING"
+                if self.has_started:
+                    self.state = "SCANNING"
+                else:
+                    self.state = "STARTUP"
                 self.phase = "INIT"
 
 
     # === ROAMING: Random motion used during testing ===
     def handle_roaming(self):
-        self.twist.linear.x = 0.3
-        self.twist.angular.z = 0.0
+        # Randomly pick -1 or 1 to turn left or right
+        turn_direction = np.random.choice([-3, 3])
+        self.twist.linear.x = 1.0
+        self.twist.angular.z = float(turn_direction)
         self.velocity_publisher.publish(self.twist)
-        time.sleep(2)
-        self.twist.linear.x = 0.0
-        self.twist.angular.z = 0.5
-        self.velocity_publisher.publish(self.twist)
-        time.sleep(2)
+        time.sleep(0.5)  # Sleep for a bit to simulate random motion
         self.stop()
         self.state = 'SCANNING'
 
@@ -558,9 +592,21 @@ class TidyBotController(Node):
         self.velocity_publisher.publish(self.twist)
 
         # Check if the robot is close enough to the target position
-        if distance_to_target < 0.4:
+        if distance_to_target < 0.2:
             self.stop()
             return True
+        
+        # If pushing phase is push forward, check if the box is close to the walls
+        if self.phase == "PUSH_FORWARD":
+            # Only check if the x or y coordinate is close
+            if self.target_marker.wall_direction in ['North', 'South']:
+                if abs(target_y - self.target_marker.position[1]) < 0.2:
+                    self.stop()
+                    return True
+            elif self.target_marker.wall_direction in ['East', 'West']:
+                if abs(target_x - self.target_marker.position[0]) < 0.2:
+                    self.stop()
+                    return True
 
         return False
 
