@@ -574,33 +574,37 @@ class TidyBotController(Node):
 
         # Normalize the angle difference
         angle_diff = (angle_to_target - self.current_angle + math.pi) % (2 * math.pi) - math.pi
-        
+
         # Calculate the distance to the target position
         distance_to_target = math.hypot(delta_x, delta_y)
 
-        # Set linear and angular velocities
-        self.twist.linear.x = 1.0  # Move forward
-        self.twist.angular.z = angle_diff # Turn towards the target
+        # Set the robot's linear and angular velocities
+        if abs(angle_diff) > 0.1:
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 0.5 if angle_diff > 0 else -0.5
+        else:
+            self.twist.linear.x = 0.3
+            self.twist.angular.z = 0.0
+
         self.velocity_publisher.publish(self.twist)
 
-        # Check if the robot is close enough to the target position
-        if distance_to_target < 0.2:
+        # If pushing phase is push forward, check if the box is close to the walls, instead of just the midpoint
+        if self.phase == "PUSH_FORWARD":
+            # Only check if the x or y coordinate is close
+            if self.target_marker.wall_direction in ['North', 'South']:
+                distance_to_target = abs(robot_y - target_y)
+                print(f"Distance to target (y): {distance_to_target}")
+            elif self.target_marker.wall_direction in ['East', 'West']:
+                distance_to_target = abs(robot_x - target_x)
+                print(f"Distance to target (x): {distance_to_target}")
+
+        # If the box is close to the wall, stop
+        if distance_to_target < 0.3:
             self.stop()
             return True
 
-        # If pushing phase is push forward, check if the box is close to the walls
-        if self.phase == "PUSH_FORWARD" and hasattr(self, 'target_marker') and self.target_marker:
-            if self.target_marker.wall_direction in ['North', 'South']:
-                if abs(target_y - self.target_marker.position[1]) < 0.2:
-                    self.stop()
-                    return True
-            elif self.target_marker.wall_direction in ['East', 'West']:
-                if abs(target_x - self.target_marker.position[0]) < 0.2:
-                    self.stop()
-                    return True
-
         return False
-    
+
     # Stop the robot by zeroing velocity
     def stop(self):
         self.twist.linear.x = 0.0
