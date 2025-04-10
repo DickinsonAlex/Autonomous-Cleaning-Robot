@@ -412,7 +412,6 @@ class TidyBotController(Node):
                 return
         # If it doesn't exist, add it to the list
         self.markers.append(new_obj)
-        print (f"Added marker: {new_obj.color} at {new_obj.angle} facing {new_obj.wall_direction}")
         
     def get_closest_pair(self):
         best_pair = None
