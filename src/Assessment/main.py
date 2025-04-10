@@ -241,7 +241,7 @@ class TidyBotController(Node):
         for pt in self.lidar_hit_points:
             x = int(pt[0] * debug_scale) + center_x
             y = int(-pt[1] * debug_scale) + center_y
-            cv2.circle(map_image, (x, y), 3, (50, 50, 50), -1)
+            cv2.circle(map_image, (x, y), 1, (20, 20, 20), -1)
 
         # Draw square from outermost points
         self.square_corners = self.get_outer_square(self.lidar_hit_points)
