@@ -141,6 +141,9 @@ class TidyBotController(Node):
                 py = y + h // 2
 
                 # Get depth at the centroid
+                if not hasattr(self, 'raw_depth_array') or self.raw_depth_array is None or self.raw_depth_array.size == 0:
+                    continue
+
                 if py >= self.raw_depth_array.shape[0] or px >= self.raw_depth_array.shape[1]:
                     continue
 
@@ -233,6 +236,12 @@ class TidyBotController(Node):
         debug_scale = 50
         center_x = 300
         center_y = 250
+
+        # Draw LiDAR points
+        for pt in self.lidar_hit_points:
+            x = int(pt[0] * debug_scale) + center_x
+            y = int(-pt[1] * debug_scale) + center_y
+            cv2.circle(map_image, (x, y), 3, (50, 50, 50), -1)
 
         # Draw square from outermost points
         self.square_corners = self.get_outer_square(self.lidar_hit_points)
@@ -577,28 +586,44 @@ class TidyBotController(Node):
 
         # Normalize the angle difference
         angle_diff = (angle_to_target - self.current_angle + math.pi) % (2 * math.pi) - math.pi
-
+        
         # Calculate the distance to the target position
         distance_to_target = math.hypot(delta_x, delta_y)
 
-        # Set the robot's linear and angular velocities
-        if abs(angle_diff) > 0.1:
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5 if angle_diff > 0 else -0.5
-        else:
-            self.twist.linear.x = 0.3
-            self.twist.angular.z = 0.0
+        # Check for obstacles in the path using LiDAR
+        obstacle_detected = False
+        for i, distance in enumerate(self.lidar_data):
+            if 0.1 < distance < 0.5:  # Adjust threshold as needed
+                angle = self.current_angle
+                obstacle_x = robot_x + distance * math.cos(angle)
+                obstacle_y = robot_y + distance * math.sin(angle)
 
+                # Check if the obstacle is in the direct path to the target
+                if abs(math.atan2(obstacle_y - robot_y, obstacle_x - robot_x) - angle_to_target) < math.radians(15):
+                    obstacle_detected = True
+                    break
+
+
+        # Adjust velocities based on obstacle detection
+        if obstacle_detected:
+            # Rotate slightly to avoid the obstacle
+            self.twist.linear.x = 0.0
+            self.twist.angular.z = 0.5  # Rotate to the right
+        else:
+            # Move towards the target
+            self.twist.linear.x = 1.0
+            self.twist.angular.z = angle_diff * 2.0  # Proportional control for rotation
+
+        self.twist.angular.z = angle_diff * 2.0  # Proportional control for rotation
         self.velocity_publisher.publish(self.twist)
 
         # Check if the robot is close enough to the target position
         if distance_to_target < 0.2:
             self.stop()
             return True
-        
+
         # If pushing phase is push forward, check if the box is close to the walls
-        if self.phase == "PUSH_FORWARD":
-            # Only check if the x or y coordinate is close
+        if self.phase == "PUSH_FORWARD" and hasattr(self, 'target_marker') and self.target_marker:
             if self.target_marker.wall_direction in ['North', 'South']:
                 if abs(target_y - self.target_marker.position[1]) < 0.2:
                     self.stop()
@@ -609,7 +634,7 @@ class TidyBotController(Node):
                     return True
 
         return False
-
+    
     # Stop the robot by zeroing velocity
     def stop(self):
         self.twist.linear.x = 0.0
