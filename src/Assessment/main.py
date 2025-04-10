@@ -25,8 +25,19 @@ class Marker:
     def __init__(self, x, y, color, angle):
         self.position = (x, y)
         self.color = color
-        self.wall_direction = None  # To be set later based on the square corners
-        self.angle = angle  # Angle of the marker in the world frame
+        self.angle = angle  # Angle of the marker in the world
+
+        # Normalize the angle to the range [0, 2π)
+        normalized_angle = self.angle % (2 * math.pi)
+
+        if math.pi / 4 <= normalized_angle < 3 * math.pi / 4:
+            self.wall_direction = 'North'
+        elif 3 * math.pi / 4 <= normalized_angle < 5 * math.pi / 4:
+            self.wall_direction = 'West'
+        elif 5 * math.pi / 4 <= normalized_angle < 7 * math.pi / 4:
+            self.wall_direction = 'South'
+        else:
+            self.wall_direction = 'East'
 
 # Class to track detected objects and their states aswell as the robot's state
 class TidyBotController(Node):
@@ -39,6 +50,7 @@ class TidyBotController(Node):
         self.phase = 'INIT'
         self.twist = Twist()
         self.has_started = False
+        self.has_Spun = False
 
         # === Objects ===
         self.boxes = []
@@ -168,28 +180,23 @@ class TidyBotController(Node):
                 world_x = robot_x + x_base * math.cos(robot_theta) - y_base * math.sin(robot_theta)
                 world_y = robot_y + x_base * math.sin(robot_theta) + y_base * math.cos(robot_theta)
                 
-                # Check if the object is against a colored wall
+                # Check if the object is against any wall
                 against_wall = False
-                for marker in self.markers:
-                    if marker.color == color:
-                        if marker.wall_direction in ['North', 'South']:
-                            # Compare y-coordinates for North/South walls
-                            if abs(world_y - marker.position[1]) < 0.2:
-                                against_wall = True
-                                break
-                        elif marker.wall_direction in ['East', 'West']:
-                            # Compare x-coordinates for East/West walls
-                            if abs(world_x - marker.position[0]) < 0.2:
-                                against_wall = True
-                                break
+                for corner in self.square_corners:
+                    next_corner = self.square_corners[(self.square_corners.index(corner) + 1) % 4]
+                    midpoint = ((corner[0] + next_corner[0]) / 2, (corner[1] + next_corner[1]) / 2)
+                    distance = math.hypot(world_x - midpoint[0], world_y - midpoint[1]) 
+                    if distance < 0.5:  # Adjust this threshold as needed
+                        against_wall = True
 
                 if py > img_h // 2:
                     obj_type = 'pushed_box' if against_wall else 'box'
                     obj = Box(obj_type, world_x, world_y, color)
                     self.update_or_add_box(obj)
                 else:
-                    abs_angle = self.current_angle  # no offset needed
-                    obj = Marker(world_x, world_y, color, abs_angle)
+                    # Get the angle from 0,0 in radians
+                    angle = math.atan2(world_y, world_x)
+                    obj = Marker(world_x, world_y, color, angle)
                     self.add_marker(obj)
 
 
@@ -277,7 +284,7 @@ class TidyBotController(Node):
 
             #If pushed, darken the color
             if obj.obj_type == 'pushed_box':
-                color = tuple(int(c * 0.5) for c in color)
+                color = tuple(int(c * 0.3) for c in color)
 
             cv2.circle(map_image, (ox, oy), 5, color, -1)
 
@@ -289,40 +296,33 @@ class TidyBotController(Node):
                 ty = int(-ty * debug_scale) + center_y
                 cv2.circle(map_image, (tx, ty), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (tx, ty), 8, (255, 0, 0), -1)
-                cv2.putText(map_image, '1', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
+                cv2.putText(map_image, 'BEHIND', (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
             if hasattr(self, 'target_box'):
                 bx = int(self.target_box.position[0] * debug_scale) + center_x
                 by = int(-self.target_box.position[1] * debug_scale) + center_y
                 cv2.circle(map_image, (bx, by), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (bx, by), 8, (255, 0, 0), -1)
-                cv2.putText(map_image, '2', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
+                cv2.putText(map_image, 'BOX', (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
             if hasattr(self, 'target_marker'):
                 mx = int(self.target_marker.position[0] * debug_scale) + center_x
                 my = int(-self.target_marker.position[1] * debug_scale) + center_y
                 cv2.circle(map_image, (mx, my), 10, (255, 255, 255), -1)
                 cv2.circle(map_image, (mx, my), 8, (255, 0, 0), -1)
-                cv2.putText(map_image, '3', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 4)
-
-            if self.phase == 'BEHIND_TARGET_BOX':
-                # Draw a line from the bot to the move_target
-                cv2.line(map_image, (rx, ry), (tx, ty), (255, 0, 255), 2)
-            elif self.phase == 'PUSH_FORWARD':
-                # Draw a line from the bot to the target_marker
-                cv2.line(map_image, (rx, ry), (mx, my), (255, 255, 0), 2)
-
+                cv2.putText(map_image, 'GOAL', (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
         # In the top left, draw the current state
         cv2.putText(map_image, f"State: {self.state}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         cv2.putText(map_image, f"Phase: {self.phase}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        cv2.putText(map_image, f"Position: {self.position}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        cv2.putText(map_image, f"Angle: {math.degrees(self.current_angle):.2f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Has Started: {self.has_started}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Position: {self.position}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+        cv2.putText(map_image, f"Angle: {math.degrees(self.current_angle):.2f}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
         # If pushing, draw the target box and marker
         if self.state == 'PUSHING':
-            cv2.putText(map_image, f"Target Box: {self.target_box.color} : {self.target_box.position}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-            cv2.putText(map_image, f"Target Marker: {self.target_marker.color} : {self.target_marker.position}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.putText(map_image, f"Target Box: {self.target_box.color} : {self.target_box.position}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.putText(map_image, f"Target Marker: {self.target_marker.color} : {self.target_marker.position}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         
         # Draw walls by color on correct square side
         for marker in self.markers:
@@ -330,16 +330,6 @@ class TidyBotController(Node):
 
                 wx, wy = marker.position
                 p1, p2 = 0,0
-
-                # Calculate the wall direction using the angle of the marker
-                if marker.angle > math.pi / 4 and marker.angle < 3 * math.pi / 4:
-                    marker.wall_direction = 'North'
-                elif marker.angle > 3 * math.pi / 4 and marker.angle < 5 * math.pi / 4:
-                    marker.wall_direction = 'West'
-                elif marker.angle > 5 * math.pi / 4 and marker.angle < 7 * math.pi / 4:
-                    marker.wall_direction = 'South'
-                else:
-                    marker.wall_direction = 'East'
 
                 # Pair the points by direction (N/E/S/W)
                 if marker.wall_direction == 'North':
@@ -393,7 +383,7 @@ class TidyBotController(Node):
                 # Check if the new object is close enough to an existing one and the same color
                 distance = math.hypot(existing.position[0] - new_obj.position[0],
                                      existing.position[1] - new_obj.position[1])
-                if existing.color == new_obj.color and distance < 0.2:
+                if existing.color == new_obj.color and distance < 0.4:
                     existing.update_position(*new_obj.position)
                     return
             self.boxes.append(new_obj)  # Otherwise it's a new box
@@ -403,7 +393,7 @@ class TidyBotController(Node):
                 # Check if the new object is close enough to an existing one and the same color
                 distance = math.hypot(existing.position[0] - new_obj.position[0],
                                      existing.position[1] - new_obj.position[1])
-                if existing.color == new_obj.color and distance < 0.2:
+                if existing.color == new_obj.color and distance < 0.4:
                     existing.update_position(*new_obj.position)
                     return
             # If it doesn't exist, add it to the list
@@ -422,6 +412,7 @@ class TidyBotController(Node):
                 return
         # If it doesn't exist, add it to the list
         self.markers.append(new_obj)
+        print (f"Added marker: {new_obj.color} at {new_obj.angle} facing {new_obj.wall_direction}")
         
     def get_closest_pair(self):
         best_pair = None
@@ -462,11 +453,15 @@ class TidyBotController(Node):
             self.twist.angular.z = 1.0
             self.velocity_publisher.publish(self.twist)
 
+            # Check if the robot has turned half way around, preventing premature has_started
+            if angle_turned := (self.current_angle - self.scan_start_angle + 2 * math.pi) % (2 * math.pi) >= math.radians(180):
+                self.has_Spun = True            
+
             angle_turned = (self.current_angle - self.scan_start_angle + 2 * math.pi) % (2 * math.pi)
             if angle_turned >= math.radians(350):
                 self.phase = "INIT"  # Reset for next time
 
-                if self.state == "STARTUP":
+                if self.state == "STARTUP" and self.has_Spun:
                     self.state = "SCANNING"  # Start scanning for boxes and markers
                     self.has_started = True
                 else:
@@ -593,15 +588,18 @@ class TidyBotController(Node):
             # Only check if the x or y coordinate is close
             if self.target_marker.wall_direction in ['North', 'South']:
                 distance_to_target = abs(robot_y - target_y)
-                print(f"Distance to target (y): {distance_to_target}")
             elif self.target_marker.wall_direction in ['East', 'West']:
                 distance_to_target = abs(robot_x - target_x)
-                print(f"Distance to target (x): {distance_to_target}")
 
-        # If the box is close to the wall, stop
-        if distance_to_target < 0.3:
-            self.stop()
-            return True
+            # If the box is close to the wall, stop
+            if distance_to_target < 0.4:
+                self.stop()
+                return True
+        else:
+            # Check if the robot is close enough to the target
+            if distance_to_target < 0.05:
+                self.stop()
+                return True
 
         return False
 
