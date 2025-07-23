@@ -1,3 +1,16 @@
+# Autonomous Cleaning Robot – "TidyBot" Project
+
+CMP3101
+This repository contains scripts to autonomusly control a cleaning robot "TidyBot" built using Python and ROS 2, designed to detect, sort, and organize colored objects within a simulated environment. The robot uses camera and LiDAR data to identify colored cubes, match them to corresponding color-coded target zones, and push them into place with precision.
+
+The project includes:
+- A DevContainer-enabled ROS 2 workspace for consistent development and simulation.
+- A main control script for navigation, object recognition, and task execution.
+- Collision avoidance, path planning, and task scheduling logic.
+= A live debugging UI displaying a visual map of the robot’s environment and actions in real time.
+
+Technical Skills: Python, ROS 2, LiDAR, Computer Vision, Autonomous Robotics, DevContainers
+
 ## ROS2 Workspace Template
 
 This repository serves as a template for creating ROS2 packages, equipped with a basic CI workflow and devcontainer configuration.
