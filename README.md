@@ -1,6 +1,5 @@
 # Autonomous Cleaning Robot – "TidyBot" Project
 
-CMP3101
 This repository contains scripts to autonomusly control a cleaning robot "TidyBot" built using Python and ROS 2, designed to detect, sort, and organize colored objects within a simulated environment. The robot uses camera and LiDAR data to identify colored cubes, match them to corresponding color-coded target zones, and push them into place with precision.
 
 The project includes:
