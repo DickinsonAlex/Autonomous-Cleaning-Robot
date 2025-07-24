@@ -1,18 +1,22 @@
 # Autonomous Cleaning Robot – "TidyBot" Project
 
-This repository contains scripts to autonomusly control a cleaning robot "TidyBot" built using Python and ROS 2, designed to detect, sort, and organize colored objects within a simulated environment. The robot uses camera and LiDAR data to identify colored cubes, match them to corresponding color-coded target zones, and push them into place with precision.
+This project contains scripts to autonomously control a cleaning robot named TidyBot, built using Python and ROS 2. TidyBot operates in a simulated environment, where it detects, sorts, and organizes colored cubes by matching them to color-coded markers and pushing them into position using camera and LiDAR data.
 
-The project includes:
-- A DevContainer-enabled ROS 2 workspace for consistent development and simulation.
-- A main control script for navigation, object recognition, and task execution.
-- Collision avoidance, path planning, and task scheduling logic.
-= A live debugging UI displaying a visual map of the robot’s environment and actions in real time.
+✅ Core Features:
+- DevContainer-enabled ROS 2 workspace for seamless development and simulation
+- Main control script for real-time navigation and object interaction
+- Multi-sensor fusion using camera and LiDAR
+- Collision avoidance and path planning
+- Task scheduling and automated return-to-base behavior
 
-Technical Skills: Python, ROS 2, LiDAR, Computer Vision, Autonomous Robotics, DevContainers
+🧠 Enhancements:
+- Live Debugging UI: Visual map of the bot’s environment, object positions, and movement history
+- Simulation Tools: Scripts included for launching the simulation and testing new tasks
 
-## ROS2 Workspace Template
+🧪 Technical Skills:
+Python • ROS 2 • LiDAR • Computer Vision • Autonomous Robotics • DevContainers
 
-This repository serves as a template for creating ROS2 packages, equipped with a basic CI workflow and devcontainer configuration.
+https://github.com/user-attachments/assets/20ce27cd-8251-4aa2-90ab-2261e6bf803e
 
 ### Development Environment Setup
 
