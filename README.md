@@ -1,4 +1,4 @@
-# Autonomous Cleaning Robot – "TidyBot" Project
+# 🤖 Autonomous Cleaning Robot – "TidyBot" Project
 
 This project contains scripts to autonomously control a cleaning robot named TidyBot, built using Python and ROS 2. TidyBot operates in a simulated environment, where it detects, sorts, and organizes colored cubes by matching them to color-coded markers and pushing them into position using camera and LiDAR data.
 
